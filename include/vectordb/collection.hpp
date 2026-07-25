@@ -7,6 +7,12 @@
 namespace vectordb
 {
 
+    struct SearchResult
+    {
+        std::string id;
+        double score;
+    };
+
     class Collection
     {
     private:
@@ -22,6 +28,8 @@ namespace vectordb
 
         void saveToFile(const std::string &filename) const;
         static Collection loadFromFile(const std::string &filename);
+
+        std::vector<SearchResult> search(const std::vector<double> &query, std::size_t k) const;
     };
 
 }

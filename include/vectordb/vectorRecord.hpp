@@ -14,6 +14,7 @@ namespace vectordb
         std::vector<double> values_;
 
     public:
+        VectorRecord() = default;
         VectorRecord(const std::string &id, const std::vector<double> &values);
 
         const std::string &getId() const;
