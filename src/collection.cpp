@@ -114,4 +114,14 @@ namespace vectordb
         return results;
     }
 
+    std::vector<VectorRecord> Collection::listRecords() const
+    {
+        std::vector<VectorRecord> records;
+        for (const auto &[id, record] : records_)
+        {
+            records.push_back(record);
+        }
+        return records;
+    }
+
 }

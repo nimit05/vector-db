@@ -30,6 +30,7 @@ namespace vectordb
         static Collection loadFromFile(const std::string &filename);
 
         std::vector<SearchResult> search(const std::vector<double> &query, std::size_t k) const;
+        std::vector<VectorRecord> listRecords() const;
     };
 
 }
