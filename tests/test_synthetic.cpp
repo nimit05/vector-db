@@ -73,7 +73,7 @@ namespace vectordb::test
 
         // Query: {1, 0} should find {1,0}, {0.9,0.1}, {0.8,0.2}
         std::vector<double> query = {1.0, 0.0};
-        auto results = col.search(query, 3);
+        auto results = col.searchExact(query, 3);
 
         EXPECT_EQ(results.size(), 3);
         // Most similar should be the identical vector
@@ -88,7 +88,7 @@ namespace vectordb::test
 
         // Query: {1, 0} - results should be sorted by score descending
         std::vector<double> query = {1.0, 0.0};
-        auto results = col.search(query, 5);
+        auto results = col.searchExact(query, 5);
 
         // Verify scores are in descending order
         for (std::size_t i = 1; i < results.size(); ++i)
@@ -104,7 +104,7 @@ namespace vectordb::test
 
         // Query: {1, 0} should find {0, 1} with ~0 similarity
         std::vector<double> query = {1.0, 0.0};
-        auto results = col.search(query, 5);
+        auto results = col.searchExact(query, 5);
 
         // Find vec1 (0, 1) in results
         auto it = std::find_if(results.begin(), results.end(),
@@ -125,7 +125,7 @@ namespace vectordb::test
 
         // Query: (1, 0, 0) - should find cluster 1
         std::vector<double> query = {1.0, 0.0, 0.0};
-        auto results = col.search(query, 3);
+        auto results = col.searchExact(query, 3);
 
         EXPECT_GE(results.size(), 3);
 
@@ -146,7 +146,7 @@ namespace vectordb::test
 
         // Query from cluster 1: (1, 0, 0)
         std::vector<double> query = {1.0, 0.0, 0.0};
-        auto results = col.search(query, 9); // Get all
+        auto results = col.searchExact(query, 9); // Get all
 
         EXPECT_EQ(results.size(), 9);
 
@@ -177,17 +177,17 @@ namespace vectordb::test
 
         // Query 1: from cluster 1 (1, 0, 0)
         std::vector<double> query1 = {1.0, 0.0, 0.0};
-        auto results1 = col.search(query1, 1);
+        auto results1 = col.searchExact(query1, 1);
         EXPECT_EQ(results1[0].id, "vec0");
 
         // Query 2: from cluster 2 (0, 1, 0)
         std::vector<double> query2 = {0.0, 1.0, 0.0};
-        auto results2 = col.search(query2, 1);
+        auto results2 = col.searchExact(query2, 1);
         EXPECT_EQ(results2[0].id, "vec3");
 
         // Query 3: from cluster 3 (0, 0, 1)
         std::vector<double> query3 = {0.0, 0.0, 1.0};
-        auto results3 = col.search(query3, 1);
+        auto results3 = col.searchExact(query3, 1);
         EXPECT_EQ(results3[0].id, "vec6");
     }
 
@@ -202,7 +202,7 @@ namespace vectordb::test
 
         // Query: (1, 0, 0) - should find itself with score 1.0
         std::vector<double> query = {1.0, 0.0, 0.0};
-        auto results = col.search(query, 1);
+        auto results = col.searchExact(query, 1);
 
         EXPECT_EQ(results[0].id, "vec0");
         EXPECT_NEAR(results[0].score, 1.0, 1e-6);
@@ -215,7 +215,7 @@ namespace vectordb::test
 
         // Query: (1, 0, 0) - (-1, 0, 0) should have score -1.0
         std::vector<double> query = {1.0, 0.0, 0.0};
-        auto results = col.search(query, 6); // Get all
+        auto results = col.searchExact(query, 6); // Get all
 
         // Find opposite vector
         auto it = std::find_if(results.begin(), results.end(),
@@ -334,7 +334,7 @@ namespace vectordb::test
             Collection col = buildCollection("scale_" + std::to_string(n), vectors);
 
             auto query = vectors[0];
-            auto results = col.search(query, 10);
+            auto results = col.searchExact(query, 10);
 
             // Should always find k results (or all if k > n)
             EXPECT_LE(results.size(), std::min(size_t(10), n));

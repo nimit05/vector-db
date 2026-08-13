@@ -8,6 +8,7 @@ enable_testing()
 
 add_library(vectordb_lib
     src/collection.cpp
+    src/ivf_index.cpp
     src/similarity.cpp
     src/vectorRecord.cpp
 )

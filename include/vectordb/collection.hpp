@@ -2,6 +2,7 @@
 
 #include <string>
 #include <unordered_map>
+#include <vector>
 #include "vectordb/vectorRecord.hpp"
 
 namespace vectordb
@@ -29,6 +30,8 @@ namespace vectordb
         void saveToFile(const std::string &filename) const;
         static Collection loadFromFile(const std::string &filename);
 
+        std::vector<SearchResult> searchExact(const std::vector<double> &query, std::size_t k) const;
+        std::vector<SearchResult> searchIVF(const std::vector<double> &query, std::size_t k, std::size_t nprobe) const;
         std::vector<SearchResult> search(const std::vector<double> &query, std::size_t k) const;
         std::vector<VectorRecord> listRecords() const;
     };

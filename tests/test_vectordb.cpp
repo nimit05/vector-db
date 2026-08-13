@@ -216,7 +216,7 @@ TEST_F(CollectionTest, SearchReturnsTopKInCorrectOrder)
     collection.insert(vectordb::VectorRecord("vec4", {0.7, 0.3, 0.0}));
 
     std::vector<double> query = {1.0, 0.0, 0.0};
-    auto results = collection.search(query, 2);
+    auto results = collection.searchExact(query, 2);
 
     EXPECT_EQ(results.size(), 2);
     EXPECT_EQ(results[0].id, "vec1");
@@ -232,7 +232,7 @@ TEST_F(CollectionTest, SearchWithKLargerThanCollectionReturnsAll)
     collection.insert(vectordb::VectorRecord("vec3", {0.0, 0.0, 1.0}));
 
     std::vector<double> query = {1.0, 0.0, 0.0};
-    auto results = collection.search(query, 10);
+    auto results = collection.searchExact(query, 10);
 
     EXPECT_EQ(results.size(), 3);
 }
@@ -244,7 +244,7 @@ TEST_F(CollectionTest, SearchWithKEqualsCollectionSize)
     collection.insert(vectordb::VectorRecord("vec2", {0.0, 1.0, 0.0}));
 
     std::vector<double> query = {1.0, 0.0, 0.0};
-    auto results = collection.search(query, 2);
+    auto results = collection.searchExact(query, 2);
 
     EXPECT_EQ(results.size(), 2);
 }
@@ -257,7 +257,7 @@ TEST_F(CollectionTest, SearchScoresAreDescending)
     collection.insert(vectordb::VectorRecord("vec3", {0.0, 1.0, 0.0}));
 
     std::vector<double> query = {1.0, 0.0, 0.0};
-    auto results = collection.search(query, 3);
+    auto results = collection.searchExact(query, 3);
 
     for (size_t i = 1; i < results.size(); ++i)
     {
@@ -272,7 +272,7 @@ TEST_F(CollectionTest, SearchWithMismatchedDimensionThrows)
 
     std::vector<double> query = {1.0, 0.0};
 
-    EXPECT_THROW(collection.search(query, 1), std::invalid_argument);
+    EXPECT_THROW(collection.searchExact(query, 1), std::invalid_argument);
 }
 
 // ============================================================================
@@ -359,7 +359,7 @@ TEST_F(CollectionTest, SaveThenLoadPreservesSearchBehavior)
 
     vectordb::Collection loaded = vectordb::Collection::loadFromFile(path);
     std::vector<double> query = {1.0, 0.0, 0.0};
-    auto results = loaded.search(query, 2);
+    auto results = loaded.searchExact(query, 2);
 
     EXPECT_EQ(results.size(), 2);
     EXPECT_EQ(results[0].id, "vec1");
@@ -413,7 +413,7 @@ TEST_F(CollectionTest, SearchEmptyCollection)
     vectordb::Collection collection("test_col");
     std::vector<double> query = {1.0, 0.0, 0.0};
 
-    auto results = collection.search(query, 5);
+    auto results = collection.searchExact(query, 5);
     EXPECT_EQ(results.size(), 0);
 }
 

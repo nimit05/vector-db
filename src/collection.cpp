@@ -1,4 +1,5 @@
 #include "vectordb/collection.hpp"
+#include "vectordb/ivf_index.hpp"
 #include "vectordb/similarity.hpp"
 
 #include <algorithm>
@@ -78,7 +79,7 @@ namespace vectordb
         return collection;
     }
 
-    std::vector<SearchResult> Collection::search(const std::vector<double> &query, std::size_t k) const
+    std::vector<SearchResult> Collection::searchExact(const std::vector<double> &query, std::size_t k) const
     {
         if (records_.empty())
         {
@@ -112,6 +113,17 @@ namespace vectordb
         }
 
         return results;
+    }
+
+    std::vector<SearchResult> Collection::searchIVF(const std::vector<double> &query, std::size_t k, std::size_t nprobe) const
+    {
+        IVFIndex index;
+        return index.search(records_, query, k, nprobe);
+    }
+
+    std::vector<SearchResult> Collection::search(const std::vector<double> &query, std::size_t k) const
+    {
+        return searchExact(query, k);
     }
 
     std::vector<VectorRecord> Collection::listRecords() const

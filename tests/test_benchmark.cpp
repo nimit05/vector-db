@@ -83,7 +83,7 @@ namespace vectordb::benchmark
                 auto query = vectors[s % vectors.size()];
 
                 auto search_start = std::chrono::high_resolution_clock::now();
-                auto results = col.search(query, k);
+                auto results = col.searchExact(query, k);
                 auto search_end = std::chrono::high_resolution_clock::now();
 
                 double search_time_us = std::chrono::duration<double, std::micro>(
