@@ -28,11 +28,17 @@ namespace vectordb
     void Collection::insert(const VectorRecord &record)
     {
         records_[record.getId()] = record;
+        indexDirty_ = true;
     }
 
     bool Collection::remove(const std::string &id)
     {
-        return records_.erase(id) > 0;
+        const bool removed = records_.erase(id) > 0;
+        if (removed)
+        {
+            indexDirty_ = true;
+        }
+        return removed;
     }
 
     void Collection::saveToFile(const std::string &filename) const
@@ -115,10 +121,32 @@ namespace vectordb
         return results;
     }
 
+    const IVFIndex &Collection::ivfIndex() const
+    {
+        if (indexDirty_ || !index_)
+        {
+            auto index = std::make_shared<IVFIndex>();
+            index->build(records_);
+            index_ = index;
+            indexDirty_ = false;
+        }
+
+        return *index_;
+    }
+
     std::vector<SearchResult> Collection::searchIVF(const std::vector<double> &query, std::size_t k, std::size_t nprobe) const
     {
-        IVFIndex index;
-        return index.search(records_, query, k, nprobe);
+        if (records_.empty())
+        {
+            return {};
+        }
+
+        return ivfIndex().search(query, k, nprobe);
+    }
+
+    std::size_t Collection::clusterCount() const
+    {
+        return ivfIndex().clusterCount();
     }
 
     std::vector<SearchResult> Collection::search(const std::vector<double> &query, std::size_t k) const

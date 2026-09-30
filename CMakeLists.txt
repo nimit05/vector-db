@@ -36,6 +36,7 @@ add_executable(vectordb_test
     tests/test_vectordb.cpp
     tests/test_synthetic.cpp
     tests/test_benchmark.cpp
+    tests/test_ivf.cpp
 )
 
 target_link_libraries(vectordb_test PRIVATE vectordb_lib gtest_main)
