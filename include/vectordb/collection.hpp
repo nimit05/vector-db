@@ -10,6 +10,7 @@ namespace vectordb
 {
 
     class IVFIndex;
+    struct SearchResponse;
 
     struct SearchResult
     {
@@ -43,6 +44,11 @@ namespace vectordb
         static Collection loadFromFile(const std::string &filename);
 
         std::vector<SearchResult> searchExact(const std::vector<double> &query, std::size_t k) const;
+
+        /// Exact top-k through the IVF index. Stops as soon as the result is
+        /// provably exact; the response says whether it stopped early (Certified)
+        /// or scanned every cluster (Exhausted), and how much it scanned.
+        SearchResponse searchIVF(const std::vector<double> &query, std::size_t k) const;
 
         /// Approximate top-k, scanning only the nprobe most promising clusters.
         /// Passing nprobe >= clusterCount() scans everything and matches searchExact.

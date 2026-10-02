@@ -4,10 +4,12 @@
 #include <cmath>
 #include <set>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "vectordb/collection.hpp"
 #include "vectordb/ivf_index.hpp"
+#include "vectordb/similarity.hpp"
 #include "vectordb/synthetic.hpp"
 #include "vectordb/vectorRecord.hpp"
 
@@ -49,6 +51,37 @@ namespace vectordb::test
                 ids.push_back(result.id);
             }
             return ids;
+        }
+
+        std::vector<std::vector<double>> flatten(
+            const std::vector<std::vector<std::vector<double>>> &clusters)
+        {
+            std::vector<std::vector<double>> vectors;
+            for (const auto &cluster : clusters)
+            {
+                vectors.insert(vectors.end(), cluster.begin(), cluster.end());
+            }
+            return vectors;
+        }
+
+        /// Scores from the two paths differ in the last ulp: searchExact divides
+        /// raw dot products by the norms, IVF dots pre-normalized copies.
+        static constexpr double kScoreTolerance = 1e-12;
+
+        /// The parity invariant: identical ids in identical order under the
+        /// (score desc, id asc) total order, scores equal within kScoreTolerance.
+        void expectMatchesExact(const std::vector<SearchResult> &ivf,
+                                const std::vector<SearchResult> &exact,
+                                const std::string &context)
+        {
+            ASSERT_EQ(ivf.size(), exact.size()) << context;
+            EXPECT_EQ(idsOf(ivf), idsOf(exact)) << context;
+
+            for (std::size_t i = 0; i < ivf.size(); ++i)
+            {
+                EXPECT_NEAR(ivf[i].score, exact[i].score, kScoreTolerance)
+                    << context << ", rank " << i;
+            }
         }
     };
 
@@ -193,25 +226,41 @@ namespace vectordb::test
     TEST_F(IVFIndexTest, FullProbeMatchesExactSearch)
     {
         synthetic::VectorGenerator generator(11);
-        auto vectors = generator.generateRandomVectors(300, 32);
+        auto vectors = flatten(generator.generateClusters(8, 40, 32));
         Collection collection = buildCollection("full_probe", vectors);
+
+        const std::size_t nlist = collection.clusterCount();
+
+        // Queries are both stored vectors and fresh random points, so the test
+        // covers queries that sit on a member as well as between clusters.
+        auto queries = generator.generateRandomVectors(20, 32);
+        for (std::size_t q = 0; q < 20; ++q)
+        {
+            queries.push_back(vectors[q * 7 % vectors.size()]);
+        }
+
+        for (std::size_t q = 0; q < queries.size(); ++q)
+        {
+            expectMatchesExact(collection.searchIVF(queries[q], 10, nlist),
+                               collection.searchExact(queries[q], 10),
+                               "query " + std::to_string(q));
+        }
+    }
+
+    TEST_F(IVFIndexTest, FullProbeMatchesExactSearchOnUnclusteredData)
+    {
+        synthetic::VectorGenerator generator(11);
+        auto vectors = generator.generateRandomVectors(300, 32);
+        Collection collection = buildCollection("full_probe_random", vectors);
 
         const std::size_t nlist = collection.clusterCount();
 
         for (std::size_t q = 0; q < 20; ++q)
         {
             const auto &query = vectors[q * 7 % vectors.size()];
-
-            auto exact = collection.searchExact(query, 10);
-            auto ivf = collection.searchIVF(query, 10, nlist);
-
-            ASSERT_EQ(ivf.size(), exact.size()) << "query " << q;
-            EXPECT_EQ(idsOf(ivf), idsOf(exact)) << "query " << q;
-
-            for (std::size_t i = 0; i < ivf.size(); ++i)
-            {
-                EXPECT_NEAR(ivf[i].score, exact[i].score, 1e-9);
-            }
+            expectMatchesExact(collection.searchIVF(query, 10, nlist),
+                               collection.searchExact(query, 10),
+                               "query " + std::to_string(q));
         }
     }
 
@@ -367,6 +416,23 @@ namespace vectordb::test
         EXPECT_EQ(perfectMatches, 3);
     }
 
+    TEST_F(IVFIndexTest, TiedScoresOrderByIdInBothSearchPaths)
+    {
+        // vec0, vec1 and vec3 are the same vector, so all three score exactly
+        // 1.0 against the query. The id tie-break must order them identically
+        // in both paths, or no parity assertion between them is reliable.
+        auto vectors = synthetic::SyntheticDatasets::duplicates();
+        Collection collection = buildCollection("dupes_order", vectors);
+
+        const std::vector<double> query{1.0, 0.0, 0.0};
+        auto exact = collection.searchExact(query, 5);
+        auto ivf = collection.searchIVF(query, 5, collection.clusterCount());
+
+        const std::vector<std::string> expected{"vec0", "vec1", "vec3", "vec2", "vec4"};
+        EXPECT_EQ(idsOf(exact), expected);
+        expectMatchesExact(ivf, exact, "duplicates");
+    }
+
     TEST_F(IVFIndexTest, UnnormalizedRecordsScoreLikeCosine)
     {
         // The index normalizes internally; scores must still match cosine
@@ -442,6 +508,239 @@ namespace vectordb::test
 
         EXPECT_NE(std::find(copyIds.begin(), copyIds.end(), "copy_only"), copyIds.end());
         EXPECT_EQ(std::find(originalIds.begin(), originalIds.end(), "copy_only"), originalIds.end());
+    }
+
+
+    // ========================================================================
+    // Provable exactness: the bound and the certificate
+    // ========================================================================
+
+    TEST_F(IVFIndexTest, BoundNeverUnderestimatesAMember)
+    {
+        // The certificate rests on this. If any member scored above its
+        // cluster's bound, search could stop before reaching it.
+        synthetic::VectorGenerator generator(31);
+        const std::vector<std::vector<std::vector<double>>> datasets{
+            flatten(generator.generateClusters(6, 30, 16)),
+            generator.generateRandomVectors(200, 16),
+        };
+
+        for (std::size_t d = 0; d < datasets.size(); ++d)
+        {
+            const auto &vectors = datasets[d];
+            auto records = buildRecords(vectors);
+
+            IVFIndex index;
+            index.build(records);
+
+            // Random queries fall between clusters; stored vectors sit inside one.
+            auto queries = generator.generateRandomVectors(30, 16);
+            for (std::size_t i = 0; i < vectors.size(); i += 11)
+            {
+                queries.push_back(vectors[i]);
+            }
+
+            for (std::size_t q = 0; q < queries.size(); ++q)
+            {
+                for (std::size_t c = 0; c < index.clusterCount(); ++c)
+                {
+                    const double bound = index.upperBound(queries[q], c);
+                    for (std::size_t member : index.clusterMembers(c))
+                    {
+                        // The reference score is itself rounded: a query equal
+                        // to a member can score an ulp above 1.0 against a bound
+                        // of exactly 1.0. Inside search, kBoundEpsilon absorbs that.
+                        const auto &values = records.at(index.id(member)).getValues();
+                        EXPECT_LE(cosineSimilarity(queries[q], values), bound + kScoreTolerance)
+                            << "dataset " << d << ", query " << q << ", cluster " << c;
+                    }
+                }
+            }
+        }
+    }
+
+    /// k-means seed that recovers the four groups of generateClusters(4, 25, 16)
+    /// from VectorGenerator(32), which the well-separated tests below rely on.
+    constexpr unsigned kRecoveringSeed = 1;
+
+    TEST_F(IVFIndexTest, WellSeparatedQueryCertifiesAfterOneCluster)
+    {
+        constexpr std::size_t kGroups = 4;
+        constexpr std::size_t kPerGroup = 25;
+
+        synthetic::VectorGenerator generator(32);
+        auto vectors = flatten(generator.generateClusters(kGroups, kPerGroup, 16));
+        auto records = buildRecords(vectors);
+        Collection collection = buildCollection("separated_exact", vectors);
+
+        // Randomly seeded k-means can merge two groups into one cluster; seed 1
+        // recovers them. This test is about the bound, not clustering quality.
+        IVFIndex index;
+        index.build(records, kGroups, kRecoveringSeed);
+
+        // Precondition: k-means recovered the generated groups, one per cluster.
+        // "vecN" was generated in group N / kPerGroup.
+        for (std::size_t c = 0; c < index.clusterCount(); ++c)
+        {
+            const auto &members = index.clusterMembers(c);
+            ASSERT_EQ(members.size(), kPerGroup) << "cluster " << c;
+
+            const std::size_t group = std::stoul(index.id(members.front()).substr(3)) / kPerGroup;
+            for (std::size_t member : members)
+            {
+                ASSERT_EQ(std::stoul(index.id(member).substr(3)) / kPerGroup, group) << "cluster " << c;
+            }
+        }
+
+        for (std::size_t i = 0; i < vectors.size(); ++i)
+        {
+            const SearchResponse response = index.search(vectors[i], 5);
+            const std::string context = "query " + std::to_string(i);
+
+            EXPECT_EQ(response.stats.status, SearchStatus::Certified) << context;
+            EXPECT_EQ(response.stats.clustersScanned, 1) << context;
+            EXPECT_EQ(response.stats.vectorsScanned, kPerGroup) << context;
+            expectMatchesExact(response.results, collection.searchExact(vectors[i], 5), context);
+        }
+    }
+
+    TEST_F(IVFIndexTest, CertificateWaitsForAFullHeap)
+    {
+        // Same well-separated data, but k exceeds a cluster's size. After the
+        // first cluster the heap is not full, there is no k-th score to compare
+        // against, and search must keep going however loose the next bound is.
+        constexpr std::size_t kGroups = 4;
+        constexpr std::size_t kPerGroup = 25;
+
+        synthetic::VectorGenerator generator(32);
+        auto vectors = flatten(generator.generateClusters(kGroups, kPerGroup, 16));
+        Collection collection = buildCollection("full_heap", vectors);
+
+        IVFIndex index;
+        index.build(buildRecords(vectors), kGroups, kRecoveringSeed);
+        for (std::size_t c = 0; c < index.clusterCount(); ++c)
+        {
+            ASSERT_EQ(index.clusterMembers(c).size(), kPerGroup) << "cluster " << c;
+        }
+
+        for (std::size_t i = 0; i < vectors.size(); i += 9)
+        {
+            const SearchResponse response = index.search(vectors[i], kPerGroup + 5);
+            const std::string context = "query " + std::to_string(i);
+
+            EXPECT_GE(response.stats.clustersScanned, 2) << context;
+            expectMatchesExact(response.results, collection.searchExact(vectors[i], kPerGroup + 5), context);
+        }
+    }
+
+    TEST_F(IVFIndexTest, ExactSearchMatchesSearchExactOverManyQueries)
+    {
+        // The load-bearing invariant of the whole index: whenever the status
+        // says the answer is exact, it is. A violated bound would not crash or
+        // look wrong; it would silently drop a true neighbor. So check it on
+        // many queries, several k, and data with ties on the k-th score.
+        synthetic::VectorGenerator generator(33);
+
+        // Every vector three times under consecutive ids, so k regularly cuts
+        // through a group of exactly tied scores.
+        std::vector<std::vector<double>> duplicated;
+        for (const auto &vector : flatten(generator.generateClusters(6, 20, 16)))
+        {
+            duplicated.insert(duplicated.end(), 3, vector);
+        }
+
+        struct Dataset
+        {
+            std::string name;
+            std::vector<std::vector<double>> vectors;
+            bool expectEarlyStops;
+        };
+
+        const std::vector<Dataset> datasets{
+            {"clustered", flatten(generator.generateClusters(8, 40, 16)), true},
+            {"duplicated", duplicated, true},
+            // Unclustered: the bound is loose and may never fire, but whatever
+            // the status, exactness must still hold.
+            {"random", generator.generateRandomVectors(300, 16), false},
+        };
+
+        for (const auto &dataset : datasets)
+        {
+            Collection collection = buildCollection(dataset.name, dataset.vectors);
+
+            auto queries = generator.generateRandomVectors(60, 16);
+            for (std::size_t i = 0; i < dataset.vectors.size(); i += 7)
+            {
+                queries.push_back(dataset.vectors[i]);
+            }
+
+            std::size_t earlyStops = 0;
+
+            for (std::size_t q = 0; q < queries.size(); ++q)
+            {
+                for (std::size_t k : {1, 5, 20})
+                {
+                    const SearchResponse response = collection.searchIVF(queries[q], k);
+                    const SearchStats &stats = response.stats;
+                    const std::string context =
+                        dataset.name + ", query " + std::to_string(q) + ", k " + std::to_string(k);
+
+                    ASSERT_TRUE(stats.status == SearchStatus::Certified ||
+                                stats.status == SearchStatus::Exhausted)
+                        << context;
+                    expectMatchesExact(response.results, collection.searchExact(queries[q], k), context);
+
+                    EXPECT_EQ(stats.totalClusters, collection.clusterCount()) << context;
+                    EXPECT_EQ(stats.totalVectors, dataset.vectors.size()) << context;
+                    EXPECT_LE(stats.vectorsScanned, stats.totalVectors) << context;
+                    EXPECT_GE(stats.elapsedMs, 0.0) << context;
+
+                    if (stats.status == SearchStatus::Certified)
+                    {
+                        EXPECT_LT(stats.clustersScanned, stats.totalClusters) << context;
+                        ++earlyStops;
+                    }
+                    else
+                    {
+                        EXPECT_EQ(stats.clustersScanned, stats.totalClusters) << context;
+                        EXPECT_EQ(stats.vectorsScanned, stats.totalVectors) << context;
+                    }
+                }
+            }
+
+            if (dataset.expectEarlyStops)
+            {
+                EXPECT_GT(earlyStops, 0) << dataset.name << ": the early-exit path was never exercised";
+            }
+        }
+    }
+
+    TEST_F(IVFIndexTest, ExactSearchEdgeCases)
+    {
+        Collection empty("empty");
+        const SearchResponse nothing = empty.searchIVF({1.0, 0.0}, 3);
+        EXPECT_TRUE(nothing.results.empty());
+        EXPECT_EQ(nothing.stats.status, SearchStatus::Exhausted);
+        EXPECT_EQ(nothing.stats.totalVectors, 0);
+
+        synthetic::VectorGenerator generator(34);
+        auto vectors = generator.generateRandomVectors(30, 8);
+        Collection collection = buildCollection("edges", vectors);
+
+        // k = 0: the empty answer is exact without scanning anything.
+        const SearchResponse none = collection.searchIVF(vectors[0], 0);
+        EXPECT_TRUE(none.results.empty());
+        EXPECT_EQ(none.stats.status, SearchStatus::Certified);
+        EXPECT_EQ(none.stats.clustersScanned, 0);
+
+        // k above the collection size: the heap never fills, so nothing can be
+        // certified and every cluster is scanned.
+        const SearchResponse all = collection.searchIVF(vectors[0], 1000);
+        EXPECT_EQ(all.results.size(), vectors.size());
+        EXPECT_EQ(all.stats.status, SearchStatus::Exhausted);
+
+        EXPECT_THROW(collection.searchIVF({1.0, 0.0}, 3), std::invalid_argument);
+        EXPECT_THROW(collection.searchIVF(std::vector<double>(8, 0.0), 3), std::invalid_argument);
     }
 
 } // namespace vectordb::test

@@ -1,6 +1,7 @@
 #include "vectordb/ivf_index.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <limits>
 #include <numeric>
@@ -124,6 +125,7 @@ namespace vectordb
         }
 
         materializeLists();
+        computeRadii();
     }
 
     void IVFIndex::seedCentroids(std::size_t nlist, unsigned seed)
@@ -258,51 +260,140 @@ namespace vectordb
         }
     }
 
-    std::vector<std::pair<double, std::size_t>> IVFIndex::rankClusters(const std::vector<double> &query) const
+    void IVFIndex::computeRadii()
     {
-        std::vector<std::pair<double, std::size_t>> ranked;
-        ranked.reserve(clusters_.size());
+        for (Cluster &cluster : clusters_)
+        {
+            // The widest member angle is the one with the smallest dot product.
+            // Starting at 1.0 rather than the first member keeps an empty cluster
+            // (which no bound can get wrong) well defined.
+            double minDot = 1.0;
+            for (std::size_t index : cluster.members)
+            {
+                minDot = std::min(minDot, dot(cluster.centroid, vectors_[index]));
+            }
+
+            // Inflate once, here, and derive the sine from the inflated cosine so
+            // the two describe the same widened cone.
+            cluster.cosRadius = std::clamp(minDot - kRadiusSlack, -1.0, 1.0);
+            cluster.sinRadius = std::sqrt(std::max(0.0, 1.0 - cluster.cosRadius * cluster.cosRadius));
+        }
+    }
+
+    std::vector<double> IVFIndex::normalizedQuery(const std::vector<double> &query) const
+    {
+        if (query.size() != dimension_)
+        {
+            throw std::invalid_argument("Query vector dimension does not match collection vectors");
+        }
+
+        std::vector<double> normalized = query;
+        if (!normalize(normalized))
+        {
+            throw std::invalid_argument("Zero vector is not allowed");
+        }
+        return normalized;
+    }
+
+    double IVFIndex::upperBound(double queryCentroidDot, const Cluster &cluster) const
+    {
+        // With θq the query-centroid angle and R the cluster radius, no member is
+        // closer to the query than θq − R, so no member scores above cos(θq − R).
+        // Expanding the angle difference keeps this in cosine space: acos is
+        // ill-conditioned as the dot product approaches 1, which is exactly the
+        // tight-cluster case.
+        const double cq = std::clamp(queryCentroidDot, -1.0, 1.0);
+
+        if (cq >= cluster.cosRadius)
+        {
+            return 1.0; // the query sits inside the cluster's cone
+        }
+
+        return cq * cluster.cosRadius + std::sqrt(std::max(0.0, 1.0 - cq * cq)) * cluster.sinRadius;
+    }
+
+    double IVFIndex::upperBound(const std::vector<double> &query, std::size_t cluster) const
+    {
+        const Cluster &target = clusters_.at(cluster);
+        return upperBound(dot(normalizedQuery(query), target.centroid), target);
+    }
+
+    std::vector<IVFIndex::ClusterBound> IVFIndex::scanOrder(const std::vector<double> &query) const
+    {
+        std::vector<ClusterBound> order;
+        order.reserve(clusters_.size());
 
         for (std::size_t c = 0; c < clusters_.size(); ++c)
         {
-            ranked.emplace_back(dot(query, clusters_[c].centroid), c);
+            const double centroidDot = dot(query, clusters_[c].centroid);
+            order.push_back({upperBound(centroidDot, clusters_[c]), centroidDot, c});
         }
 
-        std::sort(ranked.begin(), ranked.end(),
-                  [](const std::pair<double, std::size_t> &a, const std::pair<double, std::size_t> &b)
+        // Bound descending is what the stopping rule needs: every unscanned
+        // cluster is then bounded by the next one in line. Among equal bounds,
+        // typically several clusters whose cone contains the query, the nearest
+        // centroid goes first; the cluster index makes the order deterministic.
+        std::sort(order.begin(), order.end(),
+                  [](const ClusterBound &a, const ClusterBound &b)
                   {
-                      if (a.first != b.first)
+                      if (a.bound != b.bound)
                       {
-                          return a.first > b.first;
+                          return a.bound > b.bound;
                       }
-                      return a.second < b.second;
+                      if (a.centroidDot != b.centroidDot)
+                      {
+                          return a.centroidDot > b.centroidDot;
+                      }
+                      return a.cluster < b.cluster;
                   });
 
-        return ranked;
+        return order;
+    }
+
+    SearchResponse IVFIndex::search(const std::vector<double> &query, std::size_t k) const
+    {
+        return scan(query, k, clusters_.size());
     }
 
     std::vector<SearchResult> IVFIndex::search(const std::vector<double> &query,
                                                std::size_t k,
                                                std::size_t nprobe) const
     {
-        if (vectors_.empty() || k == 0)
+        return scan(query, k, std::max<std::size_t>(nprobe, 1)).results;
+    }
+
+    SearchResponse IVFIndex::scan(const std::vector<double> &query,
+                                  std::size_t k,
+                                  std::size_t maxProbes) const
+    {
+        const auto start = std::chrono::steady_clock::now();
+
+        SearchResponse response;
+        SearchStats &stats = response.stats;
+        stats.totalClusters = clusters_.size();
+        stats.totalVectors = vectors_.size();
+
+        const auto finish = [&](SearchStatus status)
         {
-            return {};
+            stats.status = status;
+            stats.elapsedMs = std::chrono::duration<double, std::milli>(
+                                  std::chrono::steady_clock::now() - start)
+                                  .count();
+            return std::move(response);
+        };
+
+        if (vectors_.empty())
+        {
+            return finish(SearchStatus::Exhausted);
+        }
+        if (k == 0)
+        {
+            return finish(SearchStatus::Certified); // the empty answer needs no scan
         }
 
-        if (query.size() != dimension_)
-        {
-            throw std::invalid_argument("Query vector dimension does not match collection vectors");
-        }
-
-        std::vector<double> normalizedQuery = query;
-        if (!normalize(normalizedQuery))
-        {
-            throw std::invalid_argument("Zero vector is not allowed");
-        }
-
-        nprobe = std::clamp<std::size_t>(nprobe == 0 ? 1 : nprobe, 1, clusters_.size());
-        const std::vector<std::pair<double, std::size_t>> ranked = rankClusters(normalizedQuery);
+        const std::vector<double> normalized = normalizedQuery(query);
+        const std::vector<ClusterBound> order = scanOrder(normalized);
+        const std::size_t probeLimit = std::min(maxProbes, order.size());
 
         struct Candidate
         {
@@ -325,27 +416,51 @@ namespace vectordb
 
         std::priority_queue<Candidate, std::vector<Candidate>, decltype(better)> heap(better);
 
-        for (std::size_t p = 0; p < nprobe; ++p)
+        SearchStatus status = SearchStatus::Exhausted;
+
+        for (std::size_t next = 0; next < order.size();)
         {
-            for (std::size_t index : clusters_[ranked[p].second].members)
+            if (next == probeLimit)
             {
-                heap.push({dot(normalizedQuery, vectors_[index]), index});
+                status = SearchStatus::BudgetHit;
+                break;
+            }
+
+            const Cluster &cluster = clusters_[order[next].cluster];
+            for (std::size_t index : cluster.members)
+            {
+                heap.push({dot(normalized, vectors_[index]), index});
                 if (heap.size() > k)
                 {
                     heap.pop();
                 }
             }
+
+            ++next;
+            ++stats.clustersScanned;
+            stats.vectorsScanned += cluster.members.size();
+
+            // Every unscanned cluster is bounded by order[next].bound. Once the
+            // k-th best score strictly clears that bound, no unscanned vector can
+            // match it, let alone outrank it on the id tie-break. The check needs
+            // a full heap: with fewer than k candidates there is no k-th score.
+            if (next < order.size() && heap.size() == k &&
+                heap.top().score > order[next].bound + kBoundEpsilon)
+            {
+                status = SearchStatus::Certified;
+                break;
+            }
         }
 
         // The heap drains worst-first, so fill back to front.
-        std::vector<SearchResult> results(heap.size());
+        response.results.resize(heap.size());
         for (std::size_t i = heap.size(); i-- > 0;)
         {
-            results[i] = {ids_[heap.top().index], heap.top().score};
+            response.results[i] = {ids_[heap.top().index], heap.top().score};
             heap.pop();
         }
 
-        return results;
+        return finish(status);
     }
 
     std::size_t IVFIndex::size() const
@@ -371,6 +486,11 @@ namespace vectordb
     const std::vector<double> &IVFIndex::centroid(std::size_t cluster) const
     {
         return clusters_.at(cluster).centroid;
+    }
+
+    const std::string &IVFIndex::id(std::size_t index) const
+    {
+        return ids_.at(index);
     }
 
 }

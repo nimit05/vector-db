@@ -107,10 +107,17 @@ namespace vectordb
             results.push_back({id, score});
         }
 
+        // Score descending, then id ascending. Record iteration order is
+        // unspecified, so without the id tie-break tied results would come out
+        // in arbitrary order. This is the same total order IVFIndex uses.
         std::sort(results.begin(), results.end(),
                   [](const SearchResult &a, const SearchResult &b)
                   {
-                      return a.score > b.score;
+                      if (a.score != b.score)
+                      {
+                          return a.score > b.score;
+                      }
+                      return a.id < b.id;
                   });
 
         if (k < results.size())
@@ -132,6 +139,11 @@ namespace vectordb
         }
 
         return *index_;
+    }
+
+    SearchResponse Collection::searchIVF(const std::vector<double> &query, std::size_t k) const
+    {
+        return ivfIndex().search(query, k);
     }
 
     std::vector<SearchResult> Collection::searchIVF(const std::vector<double> &query, std::size_t k, std::size_t nprobe) const
