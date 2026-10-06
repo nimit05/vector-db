@@ -64,6 +64,35 @@ namespace vectordb::test
             return vectors;
         }
 
+        /// True when every cluster holds exactly one generated group, whole.
+        /// Assumes ids "vecN" with vector N generated in group N / perGroup.
+        bool recoversGroups(const IVFIndex &index, std::size_t groups, std::size_t perGroup)
+        {
+            if (index.clusterCount() != groups)
+            {
+                return false;
+            }
+
+            for (std::size_t c = 0; c < index.clusterCount(); ++c)
+            {
+                const auto &members = index.clusterMembers(c);
+                if (members.size() != perGroup)
+                {
+                    return false;
+                }
+
+                const std::size_t group = std::stoul(index.id(members.front()).substr(3)) / perGroup;
+                for (std::size_t member : members)
+                {
+                    if (std::stoul(index.id(member).substr(3)) / perGroup != group)
+                    {
+                        return false;
+                    }
+                }
+            }
+            return true;
+        }
+
         /// Scores from the two paths differ in the last ulp: searchExact divides
         /// raw dot products by the norms, IVF dots pre-normalized copies.
         static constexpr double kScoreTolerance = 1e-12;
@@ -512,6 +541,77 @@ namespace vectordb::test
 
 
     // ========================================================================
+    // k-means++ seeding
+    // ========================================================================
+
+    TEST_F(IVFIndexTest, SeedingRecoversSeparatedGroupsAcrossSeeds)
+    {
+        // Uniform random seeding often put two seeds in one group and none in
+        // another, merging two groups into one wide cluster: 28 of these 50
+        // seeds recovered the small case and none recovered the larger one.
+        // Wide clusters loosen the bound, so this is a search-cost property.
+        struct Case
+        {
+            std::size_t groups;
+            std::size_t perGroup;
+            std::size_t dimension;
+            unsigned dataSeed;
+        };
+
+        constexpr unsigned kSeeds = 50;
+        constexpr unsigned kRequired = 45;
+
+        for (const Case &test : {Case{4, 25, 16, 32}, Case{16, 50, 32, 7}})
+        {
+            synthetic::VectorGenerator generator(test.dataSeed);
+            auto records = buildRecords(
+                flatten(generator.generateClusters(test.groups, test.perGroup, test.dimension)));
+
+            unsigned recovered = 0;
+            for (unsigned seed = 0; seed < kSeeds; ++seed)
+            {
+                IVFIndex index;
+                index.build(records, test.groups, seed);
+                recovered += recoversGroups(index, test.groups, test.perGroup) ? 1 : 0;
+            }
+
+            EXPECT_GE(recovered, kRequired) << test.groups << " groups of " << test.perGroup;
+        }
+    }
+
+    TEST_F(IVFIndexTest, SeedingHandlesFewerDirectionsThanClusters)
+    {
+        // Three distinct directions, many copies each, and more clusters than
+        // directions. Once every direction has a centroid all distances are
+        // zero and there is nothing left to weight a draw by.
+        std::vector<std::vector<double>> vectors;
+        for (const std::vector<double> &direction :
+             {std::vector<double>{1.0, 0.0, 0.0}, {0.0, 1.0, 0.0}, {0.0, 0.0, 1.0}})
+        {
+            vectors.insert(vectors.end(), 10, direction);
+        }
+        Collection collection = buildCollection("few_directions", vectors);
+
+        IVFIndex index;
+        index.build(buildRecords(vectors), 6);
+        ASSERT_EQ(index.clusterCount(), 6);
+
+        std::size_t total = 0;
+        for (std::size_t c = 0; c < index.clusterCount(); ++c)
+        {
+            total += index.clusterMembers(c).size();
+        }
+        EXPECT_EQ(total, vectors.size());
+
+        for (std::size_t i = 0; i < vectors.size(); i += 10)
+        {
+            expectMatchesExact(index.search(vectors[i], 12).results,
+                               collection.searchExact(vectors[i], 12),
+                               "query " + std::to_string(i));
+        }
+    }
+
+    // ========================================================================
     // Provable exactness: the bound and the certificate
     // ========================================================================
 
@@ -559,10 +659,6 @@ namespace vectordb::test
         }
     }
 
-    /// k-means seed that recovers the four groups of generateClusters(4, 25, 16)
-    /// from VectorGenerator(32), which the well-separated tests below rely on.
-    constexpr unsigned kRecoveringSeed = 1;
-
     TEST_F(IVFIndexTest, WellSeparatedQueryCertifiesAfterOneCluster)
     {
         constexpr std::size_t kGroups = 4;
@@ -573,24 +669,12 @@ namespace vectordb::test
         auto records = buildRecords(vectors);
         Collection collection = buildCollection("separated_exact", vectors);
 
-        // Randomly seeded k-means can merge two groups into one cluster; seed 1
-        // recovers them. This test is about the bound, not clustering quality.
         IVFIndex index;
-        index.build(records, kGroups, kRecoveringSeed);
+        index.build(records, kGroups);
 
         // Precondition: k-means recovered the generated groups, one per cluster.
-        // "vecN" was generated in group N / kPerGroup.
-        for (std::size_t c = 0; c < index.clusterCount(); ++c)
-        {
-            const auto &members = index.clusterMembers(c);
-            ASSERT_EQ(members.size(), kPerGroup) << "cluster " << c;
-
-            const std::size_t group = std::stoul(index.id(members.front()).substr(3)) / kPerGroup;
-            for (std::size_t member : members)
-            {
-                ASSERT_EQ(std::stoul(index.id(member).substr(3)) / kPerGroup, group) << "cluster " << c;
-            }
-        }
+        // This test is about the bound; clustering quality is tested separately.
+        ASSERT_TRUE(recoversGroups(index, kGroups, kPerGroup));
 
         for (std::size_t i = 0; i < vectors.size(); ++i)
         {
@@ -617,11 +701,8 @@ namespace vectordb::test
         Collection collection = buildCollection("full_heap", vectors);
 
         IVFIndex index;
-        index.build(buildRecords(vectors), kGroups, kRecoveringSeed);
-        for (std::size_t c = 0; c < index.clusterCount(); ++c)
-        {
-            ASSERT_EQ(index.clusterMembers(c).size(), kPerGroup) << "cluster " << c;
-        }
+        index.build(buildRecords(vectors), kGroups);
+        ASSERT_TRUE(recoversGroups(index, kGroups, kPerGroup));
 
         for (std::size_t i = 0; i < vectors.size(); i += 9)
         {

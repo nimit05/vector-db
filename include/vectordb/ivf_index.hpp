@@ -71,7 +71,8 @@ namespace vectordb
 
         /**
          * Cluster the records. nlist = 0 selects ceil(sqrt(n)).
-         * The seed makes the clustering reproducible across builds.
+         * Centroids are seeded with k-means++; the seed makes the clustering
+         * reproducible across builds.
          * Zero-length vectors have no direction and are excluded from the index.
          * This deliberately differs from Collection::searchExact, which throws
          * when the collection holds a zero record: the same collection can make

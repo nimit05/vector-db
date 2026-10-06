@@ -4,7 +4,6 @@
 #include <chrono>
 #include <cmath>
 #include <limits>
-#include <numeric>
 #include <queue>
 #include <random>
 #include <stdexcept>
@@ -130,16 +129,69 @@ namespace vectordb
 
     void IVFIndex::seedCentroids(std::size_t nlist, unsigned seed)
     {
-        std::vector<std::size_t> indices(vectors_.size());
-        std::iota(indices.begin(), indices.end(), 0);
-
+        // k-means++: the first centroid is uniform, each later one is drawn with
+        // probability proportional to its squared distance from the nearest
+        // centroid chosen so far. Points near an existing centroid are almost
+        // never picked again, so the seeds spread across the natural groups
+        // instead of doubling up in one and leaving another to be merged.
         std::mt19937 generator(seed);
-        std::shuffle(indices.begin(), indices.end(), generator);
+        std::uniform_int_distribution<std::size_t> anyVector(0, vectors_.size() - 1);
 
-        clusters_.resize(nlist);
-        for (std::size_t c = 0; c < nlist; ++c)
+        clusters_.assign(nlist, Cluster{});
+        clusters_[0].centroid = vectors_[anyVector(generator)];
+
+        // Vectors are unit length, so 1 - dot is a distance in [0, 2]. It is
+        // monotone in the angle, which is all the weighting needs.
+        const auto distance = [](const std::vector<double> &a, const std::vector<double> &b)
         {
-            clusters_[c].centroid = vectors_[indices[c]];
+            return std::max(0.0, 1.0 - dot(a, b));
+        };
+
+        std::vector<double> nearest(vectors_.size());
+        for (std::size_t i = 0; i < vectors_.size(); ++i)
+        {
+            nearest[i] = distance(vectors_[i], clusters_[0].centroid);
+        }
+
+        std::vector<double> cumulative(vectors_.size());
+
+        for (std::size_t c = 1; c < nlist; ++c)
+        {
+            double total = 0.0;
+            for (std::size_t i = 0; i < vectors_.size(); ++i)
+            {
+                total += nearest[i] * nearest[i];
+                cumulative[i] = total;
+            }
+
+            std::size_t chosen;
+            if (total == 0.0)
+            {
+                // Every vector already sits on a centroid: there are fewer
+                // distinct directions than clusters. Any pick duplicates one,
+                // and updateStep reseeds the cluster that ends up empty.
+                chosen = anyVector(generator);
+            }
+            else
+            {
+                // The first prefix sum above the draw lands on a vector with
+                // nonzero weight. A draw that rounds up to total falls back to
+                // the first vector that reaches total, which also has weight.
+                const double target = std::uniform_real_distribution<double>(0.0, total)(generator);
+                auto it = std::upper_bound(cumulative.begin(), cumulative.end(), target);
+                if (it == cumulative.end())
+                {
+                    it = std::lower_bound(cumulative.begin(), cumulative.end(), total);
+                }
+                chosen = static_cast<std::size_t>(it - cumulative.begin());
+            }
+
+            clusters_[c].centroid = vectors_[chosen];
+
+            for (std::size_t i = 0; i < vectors_.size(); ++i)
+            {
+                nearest[i] = std::min(nearest[i], distance(vectors_[i], clusters_[c].centroid));
+            }
         }
     }
 
