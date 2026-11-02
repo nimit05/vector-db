@@ -146,6 +146,11 @@ namespace vectordb
         return ivfIndex().search(query, k);
     }
 
+    SearchResponse Collection::searchIVF(const std::vector<double> &query, std::size_t k, SearchMode mode) const
+    {
+        return ivfIndex().search(query, k, mode);
+    }
+
     std::vector<SearchResult> Collection::searchIVF(const std::vector<double> &query, std::size_t k, std::size_t nprobe) const
     {
         if (records_.empty())

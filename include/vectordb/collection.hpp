@@ -12,6 +12,11 @@ namespace vectordb
     class IVFIndex;
     struct SearchResponse;
 
+    // Declared, not defined, to keep this header free of ivf_index.hpp, which
+    // includes this one for SearchResult. The definition in ivf_index.hpp must
+    // keep the same (default) underlying type.
+    enum class SearchMode;
+
     struct SearchResult
     {
         std::string id;
@@ -49,6 +54,11 @@ namespace vectordb
         /// provably exact; the response says whether it stopped early (Certified)
         /// or scanned every cluster (Exhausted), and how much it scanned.
         SearchResponse searchIVF(const std::vector<double> &query, std::size_t k) const;
+
+        /// Top-k under a mode's latency contract. SearchMode::Exact is
+        /// guaranteed exact; the other modes trade recall for latency and report
+        /// in the status how much of the index they got through.
+        SearchResponse searchIVF(const std::vector<double> &query, std::size_t k, SearchMode mode) const;
 
         /// Approximate top-k, scanning only the nprobe most promising clusters.
         /// Passing nprobe >= clusterCount() scans everything and matches searchExact.

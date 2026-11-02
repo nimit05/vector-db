@@ -50,6 +50,47 @@ namespace vectordb
         }
     }
 
+    SearchParams paramsForMode(SearchMode mode, std::size_t n)
+    {
+        // Caps are a share of the default cluster count rather than an absolute
+        // number of clusters, so "balanced" means the same fraction of the index
+        // on a thousand vectors as on a million.
+        const std::size_t nlist = n == 0
+                                      ? 1
+                                      : static_cast<std::size_t>(std::ceil(std::sqrt(static_cast<double>(n))));
+        const auto share = [nlist](std::size_t denominator)
+        {
+            return std::max<std::size_t>(1, nlist / denominator);
+        };
+
+        SearchParams params;
+
+        switch (mode)
+        {
+        case SearchMode::LowLatency:
+            params.deadline = std::chrono::milliseconds(1);
+            params.maxProbes = share(16);
+            break;
+
+        case SearchMode::Balanced:
+            params.deadline = std::chrono::milliseconds(10);
+            params.maxProbes = share(4);
+            break;
+
+        case SearchMode::HighRecall:
+            // No probe cap: scan the whole index unless the clock runs out.
+            params.deadline = std::chrono::milliseconds(100);
+            break;
+
+        case SearchMode::Exact:
+            // Neither limit, which is what makes the answer guaranteed exact:
+            // BudgetHit and DeadlineHit are unreachable from here.
+            break;
+        }
+
+        return params;
+    }
+
     void IVFIndex::build(const std::unordered_map<std::string, VectorRecord> &records,
                          std::size_t nlist,
                          unsigned seed)
@@ -402,21 +443,67 @@ namespace vectordb
         return order;
     }
 
+    std::size_t IVFIndex::adaptiveProbeFloor(const std::vector<ClusterBound> &order) const
+    {
+        // The bound can be too loose to ever fire: in high dimensions every
+        // cluster's cone is wide and every bound sits near 1, so the probe cap
+        // decides recall on its own. The gap between the best bound and the
+        // runner-up says how much that cap matters. A wide gap means the query
+        // sits unambiguously in one cluster and one probe is plenty; a gap near
+        // zero means it straddles several cones, any of which may hold the
+        // answer, and scanning only the first is a coin toss.
+        //
+        // Deliberately one small function: the shape of the ramp is a heuristic
+        // and the place to tune it should be obvious.
+        if (order.size() < 2)
+        {
+            return 1;
+        }
+
+        const double gap = order[0].bound - order[1].bound;
+        if (gap >= kAmbiguityGap)
+        {
+            return 1;
+        }
+
+        // Linear ramp: 1 probe at the full gap, kMaxProbeFloor at no gap at all.
+        const double ambiguity = 1.0 - std::max(0.0, gap) / kAmbiguityGap;
+        const double extra = ambiguity * static_cast<double>(kMaxProbeFloor - 1);
+        return 1 + static_cast<std::size_t>(std::llround(extra));
+    }
+
     SearchResponse IVFIndex::search(const std::vector<double> &query, std::size_t k) const
     {
-        return scan(query, k, clusters_.size());
+        return scan(query, k, paramsForMode(SearchMode::Exact, vectors_.size()));
+    }
+
+    SearchResponse IVFIndex::search(const std::vector<double> &query, std::size_t k, SearchMode mode) const
+    {
+        return scan(query, k, paramsForMode(mode, vectors_.size()));
+    }
+
+    SearchResponse IVFIndex::search(const std::vector<double> &query,
+                                    std::size_t k,
+                                    const SearchParams &params) const
+    {
+        return scan(query, k, params);
     }
 
     std::vector<SearchResult> IVFIndex::search(const std::vector<double> &query,
                                                std::size_t k,
                                                std::size_t nprobe) const
     {
-        return scan(query, k, std::max<std::size_t>(nprobe, 1)).results;
+        // A caller who names an exact probe count gets it: minProbes = 0 keeps
+        // the adaptive floor from widening the scan behind their back.
+        SearchParams params;
+        params.minProbes = 0;
+        params.maxProbes = std::max<std::size_t>(nprobe, 1);
+        return scan(query, k, params).results;
     }
 
     SearchResponse IVFIndex::scan(const std::vector<double> &query,
                                   std::size_t k,
-                                  std::size_t maxProbes) const
+                                  const SearchParams &params) const
     {
         const auto start = std::chrono::steady_clock::now();
 
@@ -445,7 +532,28 @@ namespace vectordb
 
         const std::vector<double> normalized = normalizedQuery(query);
         const std::vector<ClusterBound> order = scanOrder(normalized);
-        const std::size_t probeLimit = std::min(maxProbes, order.size());
+
+        // The floor only ever acts through the cap: it cannot delay a
+        // certificate, and with no cap at all it is a no-op. So raising it is
+        // safe for exactness and only spends time where recall needs it.
+        std::size_t probeFloor = params.minProbes;
+        if (probeFloor > 0)
+        {
+            probeFloor = std::max(probeFloor, adaptiveProbeFloor(order));
+        }
+        const std::size_t probeLimit =
+            params.maxProbes == 0
+                ? order.size()
+                : std::min(order.size(), std::max(params.maxProbes, probeFloor));
+
+        // Scanning best-bound-first is what makes the deadline safe: the answer
+        // only improves as clusters are added, so cutting the scan short
+        // degrades recall gracefully instead of returning garbage.
+        const bool timed = params.deadline.count() > 0;
+        const auto outOfTime = [&, start]
+        {
+            return timed && std::chrono::steady_clock::now() - start >= params.deadline;
+        };
 
         struct Candidate
         {
@@ -469,6 +577,7 @@ namespace vectordb
         std::priority_queue<Candidate, std::vector<Candidate>, decltype(better)> heap(better);
 
         SearchStatus status = SearchStatus::Exhausted;
+        bool interrupted = false;
 
         for (std::size_t next = 0; next < order.size();)
         {
@@ -479,6 +588,8 @@ namespace vectordb
             }
 
             const Cluster &cluster = clusters_[order[next].cluster];
+            std::size_t sinceClockRead = 0;
+
             for (std::size_t index : cluster.members)
             {
                 heap.push({dot(normalized, vectors_[index]), index});
@@ -486,11 +597,33 @@ namespace vectordb
                 {
                     heap.pop();
                 }
+                ++stats.vectorsScanned;
+
+                // One cluster can hold a large share of the data, so the clock
+                // is read inside the scan as well as at the boundaries. The
+                // stride always completes, so there is always something to
+                // return by the time this can fire.
+                if (++sinceClockRead == kDeadlineCheckStride)
+                {
+                    sinceClockRead = 0;
+                    if (outOfTime())
+                    {
+                        interrupted = true;
+                        break;
+                    }
+                }
+            }
+
+            if (interrupted)
+            {
+                // This cluster was left part-scanned, so it does not count as
+                // scanned; the vectors from it already do.
+                status = SearchStatus::DeadlineHit;
+                break;
             }
 
             ++next;
             ++stats.clustersScanned;
-            stats.vectorsScanned += cluster.members.size();
 
             // Every unscanned cluster is bounded by order[next].bound. Once the
             // k-th best score strictly clears that bound, no unscanned vector can
@@ -500,6 +633,15 @@ namespace vectordb
                 heap.top().score > order[next].bound + kBoundEpsilon)
             {
                 status = SearchStatus::Certified;
+                break;
+            }
+
+            // Checked after the certificate, so a proven answer is never
+            // reported as a timeout, and only with something in hand, so the
+            // deadline cannot turn into an empty result.
+            if (next < order.size() && !heap.empty() && outOfTime())
+            {
+                status = SearchStatus::DeadlineHit;
                 break;
             }
         }

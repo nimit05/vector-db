@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <set>
 #include <string>
@@ -822,6 +823,359 @@ namespace vectordb::test
 
         EXPECT_THROW(collection.searchIVF({1.0, 0.0}, 3), std::invalid_argument);
         EXPECT_THROW(collection.searchIVF(std::vector<double>(8, 0.0), 3), std::invalid_argument);
+    }
+
+    // ========================================================================
+    // Deadlines, probe budgets and modes
+    // ========================================================================
+
+    TEST_F(IVFIndexTest, ModePresetsMatchTheirContracts)
+    {
+        // Exact is the only mode whose contract rules out a limit being hit, and
+        // that is visible in its parameters: nothing to hit.
+        const SearchParams exact = paramsForMode(SearchMode::Exact, 10000);
+        EXPECT_EQ(exact.deadline.count(), 0);
+        EXPECT_EQ(exact.maxProbes, 0);
+
+        // The best-effort modes form a ladder: later modes never scan less or
+        // give up sooner than earlier ones.
+        const SearchParams low = paramsForMode(SearchMode::LowLatency, 10000);
+        const SearchParams balanced = paramsForMode(SearchMode::Balanced, 10000);
+        const SearchParams high = paramsForMode(SearchMode::HighRecall, 10000);
+
+        EXPECT_GT(low.deadline.count(), 0);
+        EXPECT_LT(low.deadline, balanced.deadline);
+        EXPECT_LT(balanced.deadline, high.deadline);
+
+        EXPECT_GE(low.maxProbes, 1);
+        EXPECT_LT(low.maxProbes, balanced.maxProbes);
+        EXPECT_EQ(high.maxProbes, 0); // uncapped: the clock is its only limit
+
+        // Caps are a share of the cluster count, so they scale with the data,
+        // and never fall below a single probe on a tiny collection.
+        EXPECT_LT(paramsForMode(SearchMode::Balanced, 100).maxProbes, balanced.maxProbes);
+        EXPECT_EQ(paramsForMode(SearchMode::LowLatency, 1).maxProbes, 1);
+        EXPECT_EQ(paramsForMode(SearchMode::Balanced, 0).maxProbes, 1);
+    }
+
+    TEST_F(IVFIndexTest, ExactModeIsAlwaysExact)
+    {
+        synthetic::VectorGenerator generator(41);
+
+        for (const auto &vectors : std::vector<std::vector<std::vector<double>>>{
+                 flatten(generator.generateClusters(6, 30, 16)),
+                 generator.generateRandomVectors(250, 24)})
+        {
+            Collection collection = buildCollection("exact_mode", vectors);
+
+            auto queries = generator.generateRandomVectors(40, vectors.front().size());
+            for (std::size_t i = 0; i < vectors.size(); i += 13)
+            {
+                queries.push_back(vectors[i]);
+            }
+
+            for (std::size_t q = 0; q < queries.size(); ++q)
+            {
+                const SearchResponse response = collection.searchIVF(queries[q], 10, SearchMode::Exact);
+                const std::string context = "query " + std::to_string(q);
+
+                // The contract: Exact never gives up, whatever the clock says.
+                ASSERT_TRUE(response.stats.status == SearchStatus::Certified ||
+                            response.stats.status == SearchStatus::Exhausted)
+                    << context;
+                expectMatchesExact(response.results, collection.searchExact(queries[q], 10), context);
+            }
+        }
+    }
+
+    TEST_F(IVFIndexTest, TightDeadlineReturnsBestEffortWithoutThrowing)
+    {
+        synthetic::VectorGenerator generator(42);
+        auto vectors = generator.generateRandomVectors(2000, 32);
+        auto records = buildRecords(vectors);
+
+        IVFIndex index;
+        index.build(records);
+
+        SearchParams impatient;
+        impatient.deadline = std::chrono::microseconds(1);
+
+        SearchParams patient;
+        patient.deadline = std::chrono::seconds(10);
+
+        std::size_t deadlineHits = 0;
+
+        for (std::size_t i = 0; i < vectors.size(); i += 211)
+        {
+            const std::string context = "query " + std::to_string(i);
+
+            const SearchResponse rushed = index.search(vectors[i], 5, impatient);
+            // A deadline cuts the scan short; it never returns nothing and never
+            // throws, because at least one stride of work always completes.
+            ASSERT_FALSE(rushed.results.empty()) << context;
+            EXPECT_GT(rushed.stats.vectorsScanned, 0) << context;
+
+            if (rushed.stats.status == SearchStatus::DeadlineHit)
+            {
+                ++deadlineHits;
+                EXPECT_LT(rushed.stats.vectorsScanned, rushed.stats.totalVectors) << context;
+            }
+
+            // Given time, the same query on the same index is exact, and the
+            // rushed answer's top hit can only be worse than the true one.
+            const SearchResponse unhurried = index.search(vectors[i], 5, patient);
+            ASSERT_TRUE(unhurried.stats.status == SearchStatus::Certified ||
+                        unhurried.stats.status == SearchStatus::Exhausted)
+                << context;
+            expectMatchesExact(unhurried.results, index.search(vectors[i], 5).results, context);
+            EXPECT_LE(rushed.results[0].score, unhurried.results[0].score + kScoreTolerance) << context;
+
+            // The query is itself in the index, so best-bound-first ordering puts
+            // it in the very first cluster: the rushed answer still finds it.
+            EXPECT_GT(rushed.results[0].score, 0.99) << context;
+        }
+
+        EXPECT_GT(deadlineHits, 0) << "a 1us deadline never fired; the clock is not being read";
+    }
+
+    TEST_F(IVFIndexTest, DeadlineInterruptsASingleOversizedCluster)
+    {
+        // With one cluster there is no boundary to check the clock at, so this
+        // can only come in under the deadline if the scan reads the clock from
+        // inside the inverted list.
+        synthetic::VectorGenerator generator(43);
+        auto vectors = generator.generateRandomVectors(20000, 64);
+
+        IVFIndex index;
+        index.build(buildRecords(vectors), 1);
+        ASSERT_EQ(index.clusterCount(), 1);
+
+        SearchParams impatient;
+        impatient.deadline = std::chrono::microseconds(1);
+
+        const SearchResponse response = index.search(generator.generateRandom(64), 5, impatient);
+
+        EXPECT_EQ(response.stats.status, SearchStatus::DeadlineHit);
+        EXPECT_EQ(response.results.size(), 5);
+        EXPECT_LT(response.stats.vectorsScanned, response.stats.totalVectors);
+        // The part-scanned cluster is not counted as scanned.
+        EXPECT_EQ(response.stats.clustersScanned, 0);
+    }
+
+    TEST_F(IVFIndexTest, ProbeBudgetReportsBudgetHit)
+    {
+        // Unclustered data in a fair number of dimensions: the bound is loose,
+        // so the cap is what ends the scan.
+        synthetic::VectorGenerator generator(44);
+        auto vectors = generator.generateRandomVectors(600, 32);
+
+        IVFIndex index;
+        index.build(buildRecords(vectors));
+        ASSERT_GT(index.clusterCount(), 2);
+
+        SearchParams capped;
+        capped.minProbes = 0; // no floor, so the cap is exactly what is scanned
+        capped.maxProbes = 2;
+
+        std::size_t budgetHits = 0;
+
+        for (std::size_t i = 0; i < 25; ++i)
+        {
+            const SearchResponse response = index.search(generator.generateRandom(32), 5, capped);
+            const std::string context = "query " + std::to_string(i);
+
+            EXPECT_LE(response.stats.clustersScanned, capped.maxProbes) << context;
+            EXPECT_EQ(response.results.size(), 5) << context;
+
+            if (response.stats.status == SearchStatus::BudgetHit)
+            {
+                ++budgetHits;
+                EXPECT_EQ(response.stats.clustersScanned, capped.maxProbes) << context;
+                EXPECT_LT(response.stats.vectorsScanned, response.stats.totalVectors) << context;
+            }
+            else
+            {
+                // The only other way out of a capped scan is a proof.
+                EXPECT_EQ(response.stats.status, SearchStatus::Certified) << context;
+            }
+        }
+
+        EXPECT_GT(budgetHits, 0) << "the cap never ended a scan; the budget path is untested";
+    }
+
+    TEST_F(IVFIndexTest, ProbeFloorRaisesTheCapButNotTheCertificate)
+    {
+        synthetic::VectorGenerator generator(45);
+        auto vectors = generator.generateRandomVectors(600, 32);
+
+        IVFIndex index;
+        index.build(buildRecords(vectors));
+
+        SearchParams floored;
+        floored.minProbes = 4;
+        floored.maxProbes = 1;
+
+        SearchParams unfloored = floored;
+        unfloored.minProbes = 0;
+
+        for (std::size_t i = 0; i < 20; ++i)
+        {
+            auto query = generator.generateRandom(32);
+            const std::string context = "query " + std::to_string(i);
+
+            const SearchResponse wide = index.search(query, 5, floored);
+            const SearchResponse narrow = index.search(query, 5, unfloored);
+
+            // The floor lifts the cap it is given, and the extra clusters can
+            // only improve the answer. It stays a floor: these bounds are loose
+            // enough that the adaptive part raises it further still, and even
+            // then the scan stops well short of the whole index.
+            EXPECT_EQ(narrow.stats.clustersScanned, 1) << context;
+            EXPECT_GE(wide.stats.clustersScanned, floored.minProbes) << context;
+            EXPECT_LT(wide.stats.clustersScanned, wide.stats.totalClusters) << context;
+            EXPECT_GE(wide.results[0].score, narrow.results[0].score - kScoreTolerance) << context;
+        }
+
+        // A floor cannot make an exact search scan past its proof: the whole
+        // point is that it acts through the cap only.
+        auto vectorsSeparated = flatten(generator.generateClusters(4, 25, 16));
+        IVFIndex separated;
+        separated.build(buildRecords(vectorsSeparated), 4);
+        ASSERT_TRUE(recoversGroups(separated, 4, 25));
+
+        SearchParams highFloor;
+        highFloor.minProbes = 4;
+
+        const SearchResponse certified = separated.search(vectorsSeparated[0], 5, highFloor);
+        EXPECT_EQ(certified.stats.status, SearchStatus::Certified);
+        EXPECT_EQ(certified.stats.clustersScanned, 1);
+    }
+
+    TEST_F(IVFIndexTest, AdaptiveFloorProbesMoreForAnAmbiguousQuery)
+    {
+        // Two tight, well-separated clusters. A query inside one of them has a
+        // wide bound gap and needs no second probe; a query halfway between the
+        // two is bounded almost equally by both, and the floor should widen the
+        // scan even though the cap says one cluster.
+        synthetic::VectorGenerator generator(46);
+        auto groups = generator.generateClusters(2, 40, 16, 0.02);
+
+        IVFIndex index;
+        index.build(buildRecords(flatten(groups)), 2);
+        ASSERT_EQ(index.clusterCount(), 2);
+
+        std::vector<double> midpoint(16, 0.0);
+        for (std::size_t d = 0; d < midpoint.size(); ++d)
+        {
+            midpoint[d] = 0.5 * (index.centroid(0)[d] + index.centroid(1)[d]);
+        }
+
+        SearchParams onlyOneProbe;
+        onlyOneProbe.maxProbes = 1;
+
+        const SearchResponse inside = index.search(index.centroid(0), 5, onlyOneProbe);
+        const SearchResponse between = index.search(midpoint, 5, onlyOneProbe);
+
+        EXPECT_EQ(inside.stats.clustersScanned, 1);
+        EXPECT_EQ(between.stats.clustersScanned, 2)
+            << "the midpoint query should not be resolved on one cluster";
+        EXPECT_EQ(between.stats.vectorsScanned, between.stats.totalVectors);
+    }
+
+    TEST_F(IVFIndexTest, ModesFormARecallLadder)
+    {
+        // More permissive modes scan at least as much and score at least as
+        // well, because clusters are visited best-bound-first: a longer prefix
+        // of the same order can only improve the answer. Timing-dependent
+        // outcomes are skipped so this cannot turn flaky on a busy machine.
+        synthetic::VectorGenerator generator(47);
+        auto vectors = generator.generateRandomVectors(800, 32);
+        Collection collection = buildCollection("ladder", vectors);
+
+        const std::vector<SearchMode> ladder{
+            SearchMode::LowLatency, SearchMode::Balanced, SearchMode::HighRecall, SearchMode::Exact};
+
+        for (std::size_t i = 0; i < 15; ++i)
+        {
+            auto query = generator.generateRandom(32);
+            const std::string context = "query " + std::to_string(i);
+
+            std::size_t previousClusters = 0;
+            double previousScore = -2.0;
+            bool comparable = true;
+
+            for (SearchMode mode : ladder)
+            {
+                const SearchResponse response = collection.searchIVF(query, 5, mode);
+                ASSERT_FALSE(response.results.empty()) << context;
+
+                if (comparable)
+                {
+                    EXPECT_GE(response.stats.clustersScanned, previousClusters) << context;
+                    EXPECT_GE(response.results[0].score, previousScore - kScoreTolerance) << context;
+                }
+
+                // A deadline makes the next comparison meaningless: the scan was
+                // cut by the clock rather than by the mode.
+                comparable = response.stats.status != SearchStatus::DeadlineHit;
+                previousClusters = response.stats.clustersScanned;
+                previousScore = response.results[0].score;
+            }
+        }
+    }
+
+    TEST_F(IVFIndexTest, BestEffortModesStillSurfaceTheObviousAnswer)
+    {
+        // Every mode, including the most impatient, finds a query that is itself
+        // in the index: it sits in the first cluster scanned.
+        synthetic::VectorGenerator generator(48);
+        auto vectors = flatten(generator.generateClusters(8, 40, 16));
+        Collection collection = buildCollection("obvious", vectors);
+
+        for (SearchMode mode : {SearchMode::LowLatency, SearchMode::Balanced,
+                                SearchMode::HighRecall, SearchMode::Exact})
+        {
+            for (std::size_t i = 0; i < vectors.size(); i += 37)
+            {
+                const SearchResponse response = collection.searchIVF(vectors[i], 1, mode);
+                ASSERT_EQ(response.results.size(), 1) << "vector " << i;
+                EXPECT_GT(response.results[0].score, 0.99) << "vector " << i;
+            }
+        }
+    }
+
+    TEST_F(IVFIndexTest, DeadlineAndBudgetEdgeCases)
+    {
+        synthetic::VectorGenerator generator(49);
+        auto vectors = generator.generateRandomVectors(200, 8);
+
+        IVFIndex index;
+        index.build(buildRecords(vectors));
+
+        SearchParams impatient;
+        impatient.deadline = std::chrono::microseconds(1);
+
+        // k = 0 needs no scan at all, so no limit can be hit.
+        const SearchResponse none = index.search(vectors[0], 0, impatient);
+        EXPECT_TRUE(none.results.empty());
+        EXPECT_EQ(none.stats.status, SearchStatus::Certified);
+
+        // An empty index has nothing to scan and nothing to time out of.
+        IVFIndex empty;
+        const SearchResponse nothing = empty.search({1.0, 0.0}, 5, SearchMode::LowLatency);
+        EXPECT_TRUE(nothing.results.empty());
+        EXPECT_EQ(nothing.stats.status, SearchStatus::Exhausted);
+
+        // A cap at or above the cluster count is no cap: the scan runs out of
+        // clusters before it runs out of budget.
+        SearchParams uncapped;
+        uncapped.maxProbes = index.clusterCount();
+        const SearchResponse full = index.search(vectors[0], 5, uncapped);
+        EXPECT_NE(full.stats.status, SearchStatus::BudgetHit);
+
+        // Bad queries are rejected before any clock or budget is consulted.
+        EXPECT_THROW(index.search({1.0, 0.0}, 5, impatient), std::invalid_argument);
+        EXPECT_THROW(index.search(std::vector<double>(8, 0.0), 5, impatient), std::invalid_argument);
     }
 
 } // namespace vectordb::test

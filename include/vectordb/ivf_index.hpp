@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <cstddef>
 #include <string>
 #include <unordered_map>
@@ -22,6 +23,12 @@ namespace vectordb
         BudgetHit,   // stopped at the probe cap; best effort
     };
 
+    /**
+     * How much of the index a search got through. clustersScanned counts only
+     * clusters scanned to the end: a search cut off by its deadline partway
+     * through a cluster reports that cluster's vectors in vectorsScanned but
+     * not the cluster itself, so the two never claim more coverage than there was.
+     */
     struct SearchStats
     {
         SearchStatus status = SearchStatus::Exhausted;
@@ -37,6 +44,58 @@ namespace vectordb
         std::vector<SearchResult> results;
         SearchStats stats;
     };
+
+    /**
+     * The latency contract of one search.
+     *
+     * deadline is a budget measured from the moment the search starts, not a
+     * point in time; 0 means no deadline. It is checked at every cluster
+     * boundary and periodically inside a cluster, so one oversized inverted
+     * list cannot overrun it. A search that runs out of time returns its
+     * best-so-far, never an empty result.
+     *
+     * maxProbes caps how many clusters are scanned; 0 means no cap. minProbes
+     * raises that cap, and is itself raised for a query the bound cannot
+     * resolve (see the adaptive floor in ivf_index.cpp). minProbes = 0 disables
+     * both floors, so maxProbes is then honoured exactly.
+     *
+     * Neither floor nor cap delays a certificate: an answer the bound has
+     * proven exact is returned as soon as it is proven.
+     */
+    struct SearchParams
+    {
+        std::chrono::microseconds deadline{0};
+        std::size_t minProbes = 1;
+        std::size_t maxProbes = 0;
+    };
+
+    /**
+     * The entire user-facing tuning surface. The modes split into two
+     * contracts:
+     *
+     *   Exact                    guaranteed exact. Terminates as Certified when
+     *                            the bound fires and Exhausted otherwise, never
+     *                            as DeadlineHit or BudgetHit.
+     *
+     *   LowLatency / Balanced /  best effort. Certified or Exhausted when the
+     *   HighRecall               data makes it free, DeadlineHit or BudgetHit
+     *                            otherwise.
+     *
+     * Exact is therefore a guarantee about the answer, not merely an absence of
+     * limits: the early exit is an optimization within it, never its definition.
+     */
+    enum class SearchMode
+    {
+        LowLatency,
+        Balanced,
+        HighRecall,
+        Exact,
+    };
+
+    /// Preset parameters for a mode over a collection of n vectors. Probe caps
+    /// are fractions of the default cluster count, so a mode means the same
+    /// share of the index whatever the collection size.
+    SearchParams paramsForMode(SearchMode mode, std::size_t n);
 
     /**
      * Inverted-file index for cosine similarity search.
@@ -69,6 +128,11 @@ namespace vectordb
         /// before the search stops. It sits on the bound's side for the same reason.
         static constexpr double kBoundEpsilon = 1e-9;
 
+        /// How many vectors a search scans between two clock reads inside one
+        /// cluster. Large enough to keep the read off the hot path, small enough
+        /// that a single huge inverted list cannot run past the deadline.
+        static constexpr std::size_t kDeadlineCheckStride = 256;
+
         /**
          * Cluster the records. nlist = 0 selects ceil(sqrt(n)).
          * Centroids are seeded with k-means++; the seed makes the clustering
@@ -88,6 +152,16 @@ namespace vectordb
          * Certified if it stopped early, Exhausted if it scanned every cluster.
          */
         SearchResponse search(const std::vector<double> &query, std::size_t k) const;
+
+        /**
+         * Top-k under a mode's latency contract. Exact is guaranteed exact;
+         * the other modes are best effort and say so in the status.
+         */
+        SearchResponse search(const std::vector<double> &query, std::size_t k, SearchMode mode) const;
+
+        /// Top-k under explicit parameters, for callers that need a deadline or
+        /// a probe cap of their own rather than one of the presets.
+        SearchResponse search(const std::vector<double> &query, std::size_t k, const SearchParams &params) const;
 
         /**
          * Top-k scanning at most nprobe clusters, in the same bound order as the
@@ -146,8 +220,19 @@ namespace vectordb
         /// Every cluster, ordered by bound descending: the order search scans them in.
         std::vector<ClusterBound> scanOrder(const std::vector<double> &query) const;
 
-        /// Shared search loop. Scans at most maxProbes clusters.
-        SearchResponse scan(const std::vector<double> &query, std::size_t k, std::size_t maxProbes) const;
+        /// Lower limit on probes for this query, from the gap between the top
+        /// two bounds. Covers the case where the bound is too loose to fire.
+        std::size_t adaptiveProbeFloor(const std::vector<ClusterBound> &order) const;
+
+        /// Shared search loop, under one latency contract.
+        SearchResponse scan(const std::vector<double> &query, std::size_t k, const SearchParams &params) const;
+
+        /// Bound gap above which the leading cluster counts as unambiguous.
+        static constexpr double kAmbiguityGap = 0.05;
+
+        /// Ceiling on the adaptive floor, so a query that straddles every cone
+        /// cannot turn a low-latency search into a full scan.
+        static constexpr std::size_t kMaxProbeFloor = 8;
 
         void seedCentroids(std::size_t nlist, unsigned seed);
         bool assignStep();
