@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+#include <cmath>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -229,6 +230,117 @@ TEST_F(CLIIntegrationTest, SearchWithMissingArguments)
     auto [exit_code, output] = runCLI("search test_col 1");
 
     EXPECT_NE(exit_code, 0);
+}
+
+// ============================================================================
+// Search Mode Tests
+// ============================================================================
+
+TEST_F(CLIIntegrationTest, SearchWithoutModeUsesBruteForceAndPrintsNoStatus)
+{
+    runCLI("insert test_col vec1 1.0 0.0 0.0");
+    runCLI("insert test_col vec2 0.0 1.0 0.0");
+
+    auto [exit_code, output] = runCLI("search test_col 1 1.0 0.0 0.0");
+
+    EXPECT_EQ(exit_code, 0);
+    EXPECT_NE(output.find("vec1"), std::string::npos);
+    EXPECT_EQ(output.find("clusters"), std::string::npos);
+}
+
+TEST_F(CLIIntegrationTest, SearchExactModePrintsCertifiedOrExhaustedStatus)
+{
+    runCLI("insert test_col vec1 1.0 0.0 0.0");
+    runCLI("insert test_col vec2 0.9 0.1 0.0");
+    runCLI("insert test_col vec3 0.0 1.0 0.0");
+
+    auto [exit_code, output] = runCLI("search test_col 2 1.0 0.0 0.0 --mode exact");
+
+    EXPECT_EQ(exit_code, 0);
+    size_t pos1 = output.find("vec1");
+    size_t pos2 = output.find("vec2");
+    ASSERT_NE(pos1, std::string::npos);
+    ASSERT_NE(pos2, std::string::npos);
+    EXPECT_LT(pos1, pos2);
+    EXPECT_EQ(output.find("vec3"), std::string::npos);
+
+    // Exact never reports a deadline or a budget, only one of the exact statuses.
+    EXPECT_TRUE(output.find("[certified") != std::string::npos ||
+                output.find("[exhausted") != std::string::npos)
+        << output;
+    EXPECT_NE(output.find("clusters"), std::string::npos);
+    EXPECT_NE(output.find(" ms]"), std::string::npos);
+}
+
+TEST_F(CLIIntegrationTest, SearchModeFlagMayPrecedeTheQuery)
+{
+    runCLI("insert test_col vec1 1.0 0.0 0.0");
+    runCLI("insert test_col vec2 0.0 1.0 0.0");
+
+    auto [exit_code, output] = runCLI("search test_col 1 --mode balanced 0.0 1.0 0.0");
+
+    EXPECT_EQ(exit_code, 0) << output;
+    EXPECT_NE(output.find("vec2"), std::string::npos);
+    EXPECT_NE(output.find("clusters"), std::string::npos);
+}
+
+TEST_F(CLIIntegrationTest, EveryModeAgreesOnTopHitForAStoredVector)
+{
+    // Enough records for several clusters, so the modes scan different amounts.
+    for (int i = 0; i < 40; ++i)
+    {
+        const double a = static_cast<double>(i) * 0.15;
+        std::ostringstream cmd;
+        cmd << "insert test_col v" << i << " " << std::cos(a) << " " << std::sin(a) << " " << (i % 5) * 0.1;
+        runCLI(cmd.str());
+    }
+
+    // The query is v7 itself, so every mode must find it first: it sits in the
+    // first cluster any of them scans.
+    const double a = 7 * 0.15;
+    std::ostringstream query;
+    query << "search test_col 1 " << std::cos(a) << " " << std::sin(a) << " " << (7 % 5) * 0.1;
+
+    for (const std::string mode : {"low_latency", "balanced", "high_recall", "exact"})
+    {
+        auto [exit_code, output] = runCLI(query.str() + " --mode " + mode);
+
+        EXPECT_EQ(exit_code, 0) << mode << ": " << output;
+        EXPECT_NE(output.find("ID: v7,"), std::string::npos) << mode << ": " << output;
+        EXPECT_NE(output.find("clusters"), std::string::npos) << mode << ": " << output;
+    }
+}
+
+TEST_F(CLIIntegrationTest, SearchWithUnknownModeFails)
+{
+    runCLI("insert test_col vec1 1.0 0.0 0.0");
+
+    auto [exit_code, output] = runCLI("search test_col 1 1.0 0.0 0.0 --mode fastest");
+
+    EXPECT_NE(exit_code, 0);
+    EXPECT_NE(output.find("Unknown search mode"), std::string::npos);
+}
+
+TEST_F(CLIIntegrationTest, SearchModeFlagWithoutValueFails)
+{
+    runCLI("insert test_col vec1 1.0 0.0 0.0");
+
+    auto [exit_code, output] = runCLI("search test_col 1 1.0 0.0 0.0 --mode");
+
+    EXPECT_NE(exit_code, 0);
+    EXPECT_NE(output.find("--mode requires a value"), std::string::npos);
+}
+
+TEST_F(CLIIntegrationTest, SearchWithModeStillRejectsBadQueries)
+{
+    runCLI("insert test_col vec1 1.0 0.0 0.0");
+
+    auto [dim_exit, dim_output] = runCLI("search test_col 1 1.0 0.0 --mode exact");
+    EXPECT_NE(dim_exit, 0);
+
+    auto [zero_exit, zero_output] = runCLI("search test_col 1 0.0 0.0 0.0 --mode exact");
+    EXPECT_NE(zero_exit, 0);
+    EXPECT_NE(zero_output.find("Zero vector"), std::string::npos);
 }
 
 // ============================================================================

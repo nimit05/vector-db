@@ -5,16 +5,17 @@
 ### Overview
 A production-ready vector database implementation in C++ with:
 - 🔍 Brute-force cosine similarity search
+- 🧭 IVF index with deadline-aware, self-certifying search (reports when an approximate answer is provably exact)
 - 💾 Persistence (JSON serialization)
 - 🎯 CLI interface for operations
-- ✅ 76 comprehensive tests (unit, integration, synthetic, benchmark)
+- ✅ 126 comprehensive tests (unit, IVF, integration, synthetic, benchmark)
 - 📊 Performance benchmarking suite with CSV export
 
 ---
 
 ## Test Results Summary
 
-### Total Tests: **76 Tests** ✅ **100% PASSED**
+### Total Tests: **126 Tests** ✅ **100% PASSED**
 
 ```
 ┌─────────────────────────────────┬───────┬────────┐
@@ -26,9 +27,15 @@ A production-ready vector database implementation in C++ with:
 │  - Similarity                   │   7   │   ✅   │
 │  - Synthetic Data               │   7   │   ✅   │
 │                                 │       │        │
-│ CLI Integration Tests           │  32   │   ✅   │
+│ IVF Index Tests                 │  43   │   ✅   │
+│  - Clustering, parity & edges   │  28   │   ✅   │
+│  - Bounds & certification       │   5   │   ✅   │
+│  - Deadlines, budgets & modes   │  10   │   ✅   │
+│                                 │       │        │
+│ CLI Integration Tests           │  39   │   ✅   │
 │  - Insert Commands              │   6   │   ✅   │
 │  - Search Commands              │   7   │   ✅   │
+│  - Search Modes                 │   7   │   ✅   │
 │  - List Commands                │   4   │   ✅   │
 │  - Delete Commands              │   4   │   ✅   │
 │  - Integration Workflows        │  11   │   ✅   │
@@ -57,8 +64,32 @@ A production-ready vector database implementation in C++ with:
 
 ### 3. Search Operations
 - **Brute-Force Search**: O(n*d) guaranteed exact results
-- **Top-K Retrieval**: Returns k nearest neighbors sorted by score
+- **Top-K Retrieval**: Returns k nearest neighbors sorted by score (ties broken by id)
 - **Scalable Implementation**: Tested up to 10,000 vectors
+
+### 3b. IVF Index (deadline-aware, self-certifying)
+- **Spherical k-means** over L2-normalized copies, seeded with k-means++; `nlist = ceil(sqrt(n))`.
+  Built lazily on first IVF search and rebuilt after any insert/delete.
+- **Self-certifying**: each cluster stores its angular radius as `cosR`/`sinR`, giving an upper
+  bound `U_c(q)` on any member's similarity without calling `acos`. Clusters are scanned in
+  decreasing-bound order; once the k-th best score strictly beats the next bound (plus a 1e-9
+  margin on the bound's side) the answer is provably exact and the scan stops.
+- **Anytime**: a latency deadline is checked at every cluster boundary and every 256 vectors
+  inside a cluster; best-bound-first ordering means a cut-off scan returns the best answer so far.
+- **Adaptive**: easy queries stop after one cluster; when the bound is too loose to fire, a probe
+  floor derived from the gap between the top two bounds widens the scan for ambiguous queries.
+- **Modes** — the whole tuning surface:
+
+  | Mode | Deadline | Probe cap | Contract |
+  |------|----------|-----------|----------|
+  | `low_latency` | 1 ms | √n / 16 clusters | best effort |
+  | `balanced` | 10 ms | √n / 4 clusters | best effort |
+  | `high_recall` | 100 ms | none | best effort |
+  | `exact` | none | none | guaranteed exact |
+
+- **Every response reports its status**: `certified` (bound proved it exact early), `exhausted`
+  (scanned everything — exact), `deadline hit` or `budget hit` (best effort), plus clusters and
+  vectors scanned and elapsed time.
 
 ### 4. Persistence
 - **JSON Serialization**: Human-readable format
@@ -70,8 +101,11 @@ A production-ready vector database implementation in C++ with:
 # Insert vector
 ./vectordb insert <collection> <id> <v1> <v2> ...
 
-# Search for k nearest neighbors
+# Search for k nearest neighbors (brute force)
 ./vectordb search <collection> <k> <q1> <q2> ...
+
+# Search through the IVF index under a latency contract
+./vectordb search <collection> <k> <q1> <q2> ... --mode <low_latency|balanced|high_recall|exact>
 
 # List all records in collection
 ./vectordb list <collection>
@@ -162,6 +196,7 @@ vector-db/
 │
 ├── include/vectordb/
 │   ├── collection.hpp          # Collection class
+│   ├── ivf_index.hpp           # IVF index, search modes and status
 │   ├── similarity.hpp          # Cosine similarity
 │   ├── vectorRecord.hpp        # Vector storage
 │   └── synthetic.hpp           # Test data generation
@@ -169,14 +204,16 @@ vector-db/
 ├── src/
 │   ├── main.cpp               # CLI interface
 │   ├── collection.cpp         # Implementation
+│   ├── ivf_index.cpp          # Clustering, bounds, deadline-aware scan
 │   ├── similarity.cpp         # Implementation
 │   └── vectorRecord.cpp       # Implementation
 │
 ├── tests/
-│   ├── test_vectordb.cpp      # Unit tests (36 tests)
-│   ├── test_synthetic.cpp     # Synthetic tests (5 tests)
-│   ├── test_benchmark.cpp     # Benchmark tests (3 tests)
-│   └── test_cli_integration.cpp # Integration tests (32 tests)
+│   ├── test_vectordb.cpp      # Unit tests (29 tests)
+│   ├── test_synthetic.cpp     # Synthetic data + correctness tests (12 tests)
+│   ├── test_benchmark.cpp     # Benchmark tests (3 tests, 3 disabled)
+│   ├── test_ivf.cpp           # IVF index tests (43 tests)
+│   └── test_cli_integration.cpp # Integration tests (39 tests)
 │
 ├── external/
 │   └── nlohmann/json.hpp      # JSON library
@@ -211,6 +248,9 @@ ctest --output-on-failure
 # CLI integration tests
 ./vectordb_cli_test
 
+# IVF index tests
+./vectordb_test --gtest_filter="IVF*"
+
 # Quick benchmark
 ./vectordb_test --gtest_filter="BruteForceBenchmark.QuickBaseline*"
 
@@ -232,6 +272,14 @@ ctest --output-on-failure
 # ID: vec1, Score: 1
 # ID: vec2, Score: 0.970143
 
+# Search through the IVF index; the last line reports how the answer was reached
+./vectordb search my_collection 2 1.0 0.0 0.0 --mode exact
+# Output:
+# Top 2 results in collection 'my_collection':
+# ID: vec1, Score: 1
+# ID: vec2, Score: 0.970143
+# [certified — scanned 1/2 clusters, 2 vectors, 0.00 ms]
+
 # List all
 ./vectordb list my_collection
 
@@ -244,7 +292,7 @@ ctest --output-on-failure
 ## Code Quality
 
 ### Testing
-- ✅ 76 comprehensive tests
+- ✅ 126 comprehensive tests
 - ✅ 100% pass rate
 - ✅ Multiple test categories
 - ✅ Edge case coverage
@@ -272,13 +320,18 @@ ctest --output-on-failure
 ## Limitations & Future Work
 
 ### Current Limitations
-- ⚠️ Brute-force only (O(n·d) search)
+- ⚠️ IVF index is not persisted: it is rebuilt in-process on each CLI run (and after any insert/delete)
+- ⚠️ In high dimensions the cluster bound is loose and rarely certifies early, so `exact` mode
+  degrades to a full scan; the best-effort modes then rely on their probe caps and deadlines
+- ⚠️ No quantization (PQ) or memory budgeting
 - ⚠️ Single-threaded
 - ⚠️ In-memory only
 - ⚠️ No distributed support
 
 ### Future Optimizations
 1. **Approximate Nearest Neighbors**
+   - ✅ IVF (inverted file) with certified early stopping — done
+   - Index persistence and incremental re-clustering
    - HNSW (Hierarchical Navigable Small World)
    - Product Quantization
    - Locality-Sensitive Hashing
@@ -338,4 +391,5 @@ This vector database implementation provides:
 - ✅ **Reliability**: Error handling and validation
 - ✅ **Extensibility**: Clean architecture for optimizations
 
-Ready for production use with brute-force search, or as a baseline for approximate nearest neighbor implementations.
+Ready for use with exact brute-force search, or with the IVF index when latency matters — every IVF
+answer says whether it is provably exact or best effort.
