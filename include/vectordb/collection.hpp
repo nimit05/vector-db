@@ -12,9 +12,8 @@ namespace vectordb
     class IVFIndex;
     struct SearchResponse;
 
-    // Declared, not defined, to keep this header free of ivf_index.hpp, which
-    // includes this one for SearchResult. The definition in ivf_index.hpp must
-    // keep the same (default) underlying type.
+    // Only declared here; the full enum is in ivf_index.hpp. (ivf_index.hpp
+    // includes this file, so this file cannot include it back.)
     enum class SearchMode;
 
     struct SearchResult
@@ -27,30 +26,27 @@ namespace vectordb
     {
     private:
         std::string name_;
-        std::unordered_map<std::string, VectorRecord> records_;
+        std::unordered_map<std::string, VectorRecord> records_; // id -> record
 
-        // Built lazily on the first IVF search. After that, inserts and removes
-        // update it in place, until the changes since the build exceed
-        // kRebuildChurn of the collection's size at the build; then it is
-        // marked dirty and rebuilt from scratch on the next IVF search.
+        // The IVF index is built on the first IVF search. After that, inserts
+        // and removes update it directly. Once more than 20% of the collection
+        // has changed since the last build, it is marked dirty and rebuilt on
+        // the next IVF search.
         //
-        // shared_ptr rather than unique_ptr because Collection is copied and
-        // returned by value; a unique_ptr member would delete the copy
-        // constructor. Copies share the index, so it is copied before any
-        // in-place update (see indexForUpdate).
+        // These are "mutable" because ivfIndex() is const (searching does not
+        // change the records) but it still has to build and cache the index.
         mutable std::shared_ptr<IVFIndex> index_;
         mutable bool indexDirty_ = true;
         mutable std::size_t changesSinceBuild_ = 0;
         mutable std::size_t sizeAtBuild_ = 0;
 
-        /// Share of the collection that may change before the index is rebuilt.
-        static constexpr double kRebuildChurn = 0.2;
+        static constexpr double kRebuildChurn = 0.2; // rebuild after 20% changes
 
+        // Returns the index, building it first if it is missing or dirty.
         const IVFIndex &ivfIndex() const;
 
-        /// Counts one change and returns the index to apply it to in place, or
-        /// nullptr when there is none or the change pushes churn past the
-        /// threshold, in which case the next IVF search rebuilds.
+        // Counts one change. Returns the index to update, or nullptr if there
+        // is no index yet or it now needs a full rebuild.
         IVFIndex *indexForUpdate();
 
     public:
@@ -63,24 +59,22 @@ namespace vectordb
         void saveToFile(const std::string &filename) const;
         static Collection loadFromFile(const std::string &filename);
 
+        // Brute force: scores every vector. Always exact.
         std::vector<SearchResult> searchExact(const std::vector<double> &query, std::size_t k) const;
 
-        /// Exact top-k through the IVF index. Stops as soon as the result is
-        /// provably exact; the response says whether it stopped early (Certified)
-        /// or scanned every cluster (Exhausted), and how much it scanned.
+        // IVF search, always exact. The response also says how much was scanned.
         SearchResponse searchIVF(const std::vector<double> &query, std::size_t k) const;
 
-        /// Top-k under a mode's latency contract. SearchMode::Exact is
-        /// guaranteed exact; the other modes trade recall for latency and report
-        /// in the status how much of the index they got through.
+        // IVF search with a mode (LowLatency, Balanced, HighRecall, Exact).
         SearchResponse searchIVF(const std::vector<double> &query, std::size_t k, SearchMode mode) const;
 
-        /// Approximate top-k, scanning only the nprobe most promising clusters.
-        /// Passing nprobe >= clusterCount() scans everything and matches searchExact.
+        // IVF search that scans at most nprobe clusters.
         std::vector<SearchResult> searchIVF(const std::vector<double> &query, std::size_t k, std::size_t nprobe) const;
 
-        /// Number of clusters in the index, building it if necessary.
+        // Number of clusters (builds the index if needed).
         std::size_t clusterCount() const;
+
+        // Same as searchExact.
         std::vector<SearchResult> search(const std::vector<double> &query, std::size_t k) const;
         std::vector<VectorRecord> listRecords() const;
     };

@@ -11,24 +11,19 @@
 namespace vectordb
 {
 
-    /**
-     * How a search ended. Certified and Exhausted both mean the results are the
-     * exact top-k; they differ only in how that was established.
-     */
+    // Why a search stopped.
+    // Certified and Exhausted both mean the answer is exactly right.
     enum class SearchStatus
     {
-        Certified,   // the bound proved the answer exact before every cluster was scanned
-        Exhausted,   // every cluster was scanned, so the answer is trivially exact
-        DeadlineHit, // stopped at the latency deadline; best effort
-        BudgetHit,   // stopped at the probe cap; best effort
+        Certified,   // the bound proved the answer before all clusters were scanned
+        Exhausted,   // every cluster was scanned
+        DeadlineHit, // ran out of time (best effort)
+        BudgetHit,   // hit the cluster limit (best effort)
     };
 
-    /**
-     * How much of the index a search got through. clustersScanned counts only
-     * clusters scanned to the end: a search cut off by its deadline partway
-     * through a cluster reports that cluster's vectors in vectorsScanned but
-     * not the cluster itself, so the two never claim more coverage than there was.
-     */
+    // How much work one search did.
+    // A cluster cut off halfway by the deadline is not counted in clustersScanned,
+    // but its vectors that were scored are counted in vectorsScanned.
     struct SearchStats
     {
         SearchStatus status = SearchStatus::Exhausted;
@@ -45,23 +40,11 @@ namespace vectordb
         SearchStats stats;
     };
 
-    /**
-     * The latency contract of one search.
-     *
-     * deadline is a budget measured from the moment the search starts, not a
-     * point in time; 0 means no deadline. It is checked at every cluster
-     * boundary and periodically inside a cluster, so one oversized inverted
-     * list cannot overrun it. A search that runs out of time returns its
-     * best-so-far, never an empty result.
-     *
-     * maxProbes caps how many clusters are scanned; 0 means no cap. minProbes
-     * raises that cap, and is itself raised for a query the bound cannot
-     * resolve (see the adaptive floor in ivf_index.cpp). minProbes = 0 disables
-     * both floors, so maxProbes is then honoured exactly.
-     *
-     * Neither floor nor cap delays a certificate: an answer the bound has
-     * proven exact is returned as soon as it is proven.
-     */
+    // Limits for one search.
+    //   deadline  - time allowed for the search (0 = no limit)
+    //   maxProbes - most clusters to scan (0 = no limit)
+    //   minProbes - lowest allowed cluster limit; ambiguous queries may raise it
+    //               further. 0 turns this off, so maxProbes is used exactly.
     struct SearchParams
     {
         std::chrono::microseconds deadline{0};
@@ -69,203 +52,142 @@ namespace vectordb
         std::size_t maxProbes = 0;
     };
 
-    /**
-     * The entire user-facing tuning surface. The modes split into two
-     * contracts:
-     *
-     *   Exact                    guaranteed exact. Terminates as Certified when
-     *                            the bound fires and Exhausted otherwise, never
-     *                            as DeadlineHit or BudgetHit.
-     *
-     *   LowLatency / Balanced /  best effort. Certified or Exhausted when the
-     *   HighRecall               data makes it free, DeadlineHit or BudgetHit
-     *                            otherwise.
-     *
-     * Exact is therefore a guarantee about the answer, not merely an absence of
-     * limits: the early exit is an optimization within it, never its definition.
-     */
+    // Search modes, from fastest to most accurate.
+    // Exact is always exactly right. The others may stop early and say so in the status.
     enum class SearchMode
     {
-        LowLatency,
-        Balanced,
-        HighRecall,
-        Exact,
+        LowLatency, // 1 ms, at most 1/16 of the clusters
+        Balanced,   // 10 ms, at most 1/4 of the clusters
+        HighRecall, // 100 ms, no cluster limit
+        Exact,      // no limits
     };
 
-    /// Preset parameters for a mode over a collection of n vectors. Probe caps
-    /// are fractions of the default cluster count, so a mode means the same
-    /// share of the index whatever the collection size.
+    // Returns the limits for a mode, for a collection of n vectors.
     SearchParams paramsForMode(SearchMode mode, std::size_t n);
 
-    /**
-     * Inverted-file index for cosine similarity search.
-     *
-     * Build clusters the collection with spherical k-means, then stores an
-     * inverted list of member indices per centroid, plus the angular radius of
-     * each cluster: the widest angle between its centroid and any member.
-     *
-     * The radius gives an upper bound on how similar any member of a cluster
-     * can be to a query. Search scans clusters best-bound-first and stops once
-     * the k-th best score found beats the bound of every unscanned cluster, at
-     * which point the answer is provably exact.
-     *
-     * The index keeps its own L2-normalized copy of the data, so cosine
-     * similarity reduces to a plain dot product. Records in the Collection are
-     * left untouched.
-     */
+    // IVF index for cosine similarity search.
+    //
+    // build() groups the vectors into clusters with k-means. For every cluster
+    // we store its centroid, the list of its members, and its radius (the angle
+    // from the centroid to the farthest member).
+    //
+    // From the radius we get an upper bound: the best score any member of the
+    // cluster could have for a query. Search visits clusters from the highest
+    // bound down, and stops when the k-th best score found so far beats the
+    // bound of the next cluster. At that point the answer is proven exact.
+    //
+    // The index stores normalized (unit length) copies of the vectors, so
+    // cosine similarity is just a dot product.
     class IVFIndex
     {
     public:
-        /// Default cap on k-means iterations before the build gives up.
+        // Most k-means rounds to run.
         static constexpr std::size_t kMaxIterations = 20;
 
-        /// Subtracted from each cluster's cosine radius, at build and whenever
-        /// add() widens a cone. Widening every cone keeps the bound an
-        /// over-estimate despite rounding error, so numerical error can only
-        /// cost an early stop, never a false certificate.
+        // Small safety margins against rounding errors. They make the bound a
+        // little too high rather than too low, so we may miss an early stop but
+        // never wrongly claim an answer is exact.
         static constexpr double kRadiusSlack = 1e-9;
-
-        /// Margin the k-th best score must clear above the next cluster's bound
-        /// before the search stops. It sits on the bound's side for the same reason.
         static constexpr double kBoundEpsilon = 1e-9;
 
-        /// How many vectors a search scans between two clock reads inside one
-        /// cluster. Large enough to keep the read off the hot path, small enough
-        /// that a single huge inverted list cannot run past the deadline.
+        // Inside a cluster, check the clock once every this many vectors.
         static constexpr std::size_t kDeadlineCheckStride = 256;
 
-        /**
-         * Cluster the records. nlist = 0 selects ceil(sqrt(n)).
-         * Centroids are seeded with k-means++; the seed makes the clustering
-         * reproducible across builds.
-         * Zero-length vectors have no direction and are excluded from the index.
-         * This deliberately differs from Collection::searchExact, which throws
-         * when the collection holds a zero record: the same collection can make
-         * searchExact throw while IVF search succeeds.
-         */
+        // Builds the index. nlist = number of clusters (0 means ceil(sqrt(n))).
+        // The same seed always gives the same clusters.
+        // Zero vectors have no direction, so they are left out of the index.
         void build(const std::unordered_map<std::string, VectorRecord> &records,
                    std::size_t nlist = 0,
                    unsigned seed = 42);
 
-        /**
-         * Adds one vector without re-clustering, replacing any vector with the
-         * same id. The vector joins the cluster with the nearest centroid, and
-         * that cluster's radius is widened to cover it, so search stays exact.
-         * Centroids do not move, so clustering quality drifts as vectors are
-         * added; the caller decides when to rebuild.
-         *
-         * Returns false, leaving the index unchanged, when the vector cannot be
-         * placed: the index has no clusters, or the dimension differs. A zero
-         * vector is accepted and, as in build, not indexed.
-         */
+        // Adds one vector to its nearest cluster without re-running k-means,
+        // and widens that cluster's radius if needed. Replaces an old vector
+        // with the same id. Returns false if it cannot be added (no clusters
+        // yet, or wrong length). A zero vector is accepted but not stored.
         bool add(const std::string &id, const std::vector<double> &values);
 
-        /**
-         * Removes the vector with this id; returns false if it is not indexed.
-         * Its cluster's radius is left as it was: the cone still contains every
-         * remaining member, so the bound stays correct, only looser.
-         */
+        // Removes a vector. Returns false if the id is not in the index.
+        // The radius is not shrunk: it is a bit too wide but still correct.
         bool remove(const std::string &id);
 
-        /**
-         * Exact top-k by cosine similarity. Scans clusters in decreasing bound
-         * order and stops as soon as the result is provably exact. The status is
-         * Certified if it stopped early, Exhausted if it scanned every cluster.
-         */
+        // Exact top-k (same as SearchMode::Exact).
         SearchResponse search(const std::vector<double> &query, std::size_t k) const;
 
-        /**
-         * Top-k under a mode's latency contract. Exact is guaranteed exact;
-         * the other modes are best effort and say so in the status.
-         */
+        // Top-k using a mode's limits.
         SearchResponse search(const std::vector<double> &query, std::size_t k, SearchMode mode) const;
 
-        /// Top-k under explicit parameters, for callers that need a deadline or
-        /// a probe cap of their own rather than one of the presets.
+        // Top-k using your own limits.
         SearchResponse search(const std::vector<double> &query, std::size_t k, const SearchParams &params) const;
 
-        /**
-         * Top-k scanning at most nprobe clusters, in the same bound order as the
-         * exact search, and stopping sooner if the answer is certified first.
-         * nprobe is clamped to [1, clusterCount()]; passing clusterCount()
-         * scans everything and is equivalent to an exact search.
-         */
+        // Top-k scanning at most nprobe clusters. May still stop earlier if
+        // the bound proves the answer.
         std::vector<SearchResult> search(const std::vector<double> &query,
                                          std::size_t k,
                                          std::size_t nprobe) const;
 
-        /**
-         * Upper bound on the cosine similarity between the query and any member
-         * of the cluster. Never below the true maximum.
-         */
+        // Best possible score any member of this cluster can have for the query.
         double upperBound(const std::vector<double> &query, std::size_t cluster) const;
 
         std::size_t size() const;
         std::size_t clusterCount() const;
         std::size_t dimension() const;
 
-        /// Member indices of a cluster, indexing into the flat vector arrays.
+        // Positions (into the index's vector list) of a cluster's members.
         const std::vector<std::size_t> &clusterMembers(std::size_t cluster) const;
-
-        /// Unit-norm centroid of a cluster.
         const std::vector<double> &centroid(std::size_t cluster) const;
 
-        /// Record id of the vector at a flat index, as returned by clusterMembers.
+        // The id of the vector at a position.
         const std::string &id(std::size_t index) const;
 
     private:
         struct Cluster
         {
             std::vector<double> centroid;
-            std::vector<std::size_t> members;
+            std::vector<std::size_t> members; // positions in vectors_
 
-            // Cosine and sine of the widest angle between the centroid and any
-            // member, widened by kRadiusSlack. Every member lies inside this cone.
+            // The radius, stored as its cosine and sine.
             double cosRadius = 1.0;
             double sinRadius = 0.0;
         };
 
+        // One cluster's bound for the current query.
         struct ClusterBound
         {
-            double bound;       // upper bound on any member's similarity to the query
-            double centroidDot; // query-centroid similarity, used to break ties
+            double bound;       // best possible score in this cluster
+            double centroidDot; // query-centroid score, used to break ties
             std::size_t cluster;
         };
 
-        /// Validates the query against the index and returns a unit-length copy.
-        std::vector<double> normalizedQuery(const std::vector<double> &query) const;
-
-        /// The bound itself, from the query-centroid dot product the caller already has.
-        double upperBound(double queryCentroidDot, const Cluster &cluster) const;
-
-        /// Every cluster, ordered by bound descending: the order search scans them in.
-        std::vector<ClusterBound> scanOrder(const std::vector<double> &query) const;
-
-        /// Lower limit on probes for this query, from the gap between the top
-        /// two bounds. Covers the case where the bound is too loose to fire.
-        std::size_t adaptiveProbeFloor(const std::vector<ClusterBound> &order) const;
-
-        /// Shared search loop, under one latency contract.
-        SearchResponse scan(const std::vector<double> &query, std::size_t k, const SearchParams &params) const;
-
-        /// Bound gap above which the leading cluster counts as unambiguous.
+        // If the top two bounds are closer than this, the query is ambiguous.
         static constexpr double kAmbiguityGap = 0.05;
 
-        /// Ceiling on the adaptive floor, so a query that straddles every cone
-        /// cannot turn a low-latency search into a full scan.
+        // Most clusters an ambiguous query can add to the limit.
         static constexpr std::size_t kMaxProbeFloor = 8;
 
+        // k-means steps
         void seedCentroids(std::size_t nlist, unsigned seed);
         bool assignStep();
         void updateStep();
-        void materializeLists();
+        void buildMemberLists();
         void computeRadii();
 
+        // search helpers
+        std::size_t nearestCluster(const std::vector<double> &vec) const;
+        std::vector<double> normalizedQuery(const std::vector<double> &query) const;
+        double upperBound(double queryCentroidDot, const Cluster &cluster) const;
+        static bool scanBefore(const ClusterBound &a, const ClusterBound &b);
+        std::vector<ClusterBound> scanOrder(const std::vector<double> &query) const;
+        std::size_t adaptiveProbeFloor(const std::vector<ClusterBound> &order) const;
+        std::size_t clusterLimit(const SearchParams &params, const std::vector<ClusterBound> &order) const;
+        SearchResponse scan(const std::vector<double> &query, std::size_t k, const SearchParams &params) const;
+
+        // Position i in these lists is one vector.
         std::vector<std::string> ids_;
-        std::vector<std::vector<double>> vectors_; // normalized copies of the records
-        std::vector<std::size_t> assignment_;      // assignment_[i] = cluster of vectors_[i]
+        std::vector<std::vector<double>> vectors_; // normalized copies
+        std::vector<std::size_t> assignment_;      // which cluster each vector is in
+
         std::vector<Cluster> clusters_;
-        std::unordered_map<std::string, std::size_t> position_; // id -> flat index
+        std::unordered_map<std::string, std::size_t> position_; // id -> position
         std::size_t dimension_ = 0;
     };
 

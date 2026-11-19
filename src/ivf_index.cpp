@@ -11,85 +11,132 @@
 namespace vectordb
 {
 
+    using Clock = std::chrono::steady_clock;
+
     namespace
     {
-        constexpr double kNormEpsilon = 1e-12;
-        constexpr std::size_t kUnassigned = std::numeric_limits<std::size_t>::max();
+        const std::size_t kNone = std::numeric_limits<std::size_t>::max();
 
         double dot(const std::vector<double> &a, const std::vector<double> &b)
         {
             double sum = 0.0;
-            for (std::size_t i = 0; i < a.size(); ++i)
+            for (std::size_t i = 0; i < a.size(); i++)
             {
                 sum += a[i] * b[i];
             }
             return sum;
         }
 
-        /// Scales the vector to unit length. Returns false for a zero vector,
-        /// which has no direction and cannot be normalized.
+        // Makes the vector length 1. Returns false for a zero vector,
+        // because it has no direction.
         bool normalize(std::vector<double> &values)
         {
-            double norm = 0.0;
-            for (double value : values)
+            double length = 0.0;
+            for (double v : values)
             {
-                norm += value * value;
+                length += v * v;
             }
-            norm = std::sqrt(norm);
+            length = std::sqrt(length);
 
-            if (norm < kNormEpsilon)
+            if (length < 1e-12)
             {
                 return false;
             }
 
-            for (double &value : values)
+            for (double &v : values)
             {
-                value /= norm;
+                v /= length;
             }
             return true;
         }
+
+        // Distance between two unit vectors: 0 when equal, 2 when opposite.
+        double distance(const std::vector<double> &a, const std::vector<double> &b)
+        {
+            return std::max(0.0, 1.0 - dot(a, b));
+        }
+
+        double millisecondsSince(Clock::time_point start)
+        {
+            return std::chrono::duration<double, std::milli>(Clock::now() - start).count();
+        }
+
+        bool timeIsUp(Clock::time_point start, std::chrono::microseconds deadline)
+        {
+            if (deadline.count() == 0)
+            {
+                return false; // no deadline
+            }
+            return Clock::now() - start >= deadline;
+        }
+
+        // A possible result while searching.
+        struct Candidate
+        {
+            double score;
+            std::string id;
+        };
+
+        // Higher score wins. If the scores are equal, the smaller id wins,
+        // so results always come out in the same order.
+        bool ranksHigher(const Candidate &a, const Candidate &b)
+        {
+            if (a.score != b.score)
+            {
+                return a.score > b.score;
+            }
+            return a.id < b.id;
+        }
+
+        // std::priority_queue keeps the "biggest" item on top. We want the
+        // WORST candidate on top, so we can throw it out quickly when a better
+        // one comes along. So we tell it that better candidates are "smaller".
+        struct WorstOnTop
+        {
+            bool operator()(const Candidate &a, const Candidate &b) const
+            {
+                return ranksHigher(a, b);
+            }
+        };
     }
+
+    // ------------------------------------------------------------------
+    // Search modes
+    // ------------------------------------------------------------------
 
     SearchParams paramsForMode(SearchMode mode, std::size_t n)
     {
-        // Caps are a share of the default cluster count rather than an absolute
-        // number of clusters, so "balanced" means the same fraction of the index
-        // on a thousand vectors as on a million.
-        const std::size_t nlist = n == 0
-                                      ? 1
-                                      : static_cast<std::size_t>(std::ceil(std::sqrt(static_cast<double>(n))));
-        const auto share = [nlist](std::size_t denominator)
+        // Default number of clusters is ceil(sqrt(n)).
+        std::size_t numClusters = 1;
+        if (n > 0)
         {
-            return std::max<std::size_t>(1, nlist / denominator);
-        };
+            numClusters = static_cast<std::size_t>(std::ceil(std::sqrt(static_cast<double>(n))));
+        }
 
         SearchParams params;
 
-        switch (mode)
+        if (mode == SearchMode::LowLatency)
         {
-        case SearchMode::LowLatency:
             params.deadline = std::chrono::milliseconds(1);
-            params.maxProbes = share(16);
-            break;
-
-        case SearchMode::Balanced:
-            params.deadline = std::chrono::milliseconds(10);
-            params.maxProbes = share(4);
-            break;
-
-        case SearchMode::HighRecall:
-            // No probe cap: scan the whole index unless the clock runs out.
-            params.deadline = std::chrono::milliseconds(100);
-            break;
-
-        case SearchMode::Exact:
-            // Neither limit, which is what makes the answer guaranteed exact:
-            // BudgetHit and DeadlineHit are unreachable from here.
-            break;
+            params.maxProbes = std::max<std::size_t>(1, numClusters / 16);
         }
+        else if (mode == SearchMode::Balanced)
+        {
+            params.deadline = std::chrono::milliseconds(10);
+            params.maxProbes = std::max<std::size_t>(1, numClusters / 4);
+        }
+        else if (mode == SearchMode::HighRecall)
+        {
+            params.deadline = std::chrono::milliseconds(100); // no cluster limit
+        }
+        // Exact: no limits at all.
 
         return params;
     }
+
+    // ------------------------------------------------------------------
+    // Building the index (k-means)
+    // ------------------------------------------------------------------
 
     void IVFIndex::build(const std::unordered_map<std::string, VectorRecord> &records,
                          std::size_t nlist,
@@ -107,42 +154,38 @@ namespace vectordb
             return;
         }
 
-        // unordered_map iteration order is unspecified, so walk the records in
-        // sorted id order instead. Without this a fixed seed would still give a
-        // different clustering from run to run.
-        std::vector<const VectorRecord *> ordered;
-        ordered.reserve(records.size());
-        for (const auto &[id, record] : records)
+        // An unordered_map has no fixed order. Sort the ids so the same data
+        // always gives the same clusters.
+        std::vector<std::string> sortedIds;
+        for (const auto &entry : records)
         {
-            ordered.push_back(&record);
+            sortedIds.push_back(entry.first);
         }
-        std::sort(ordered.begin(), ordered.end(),
-                  [](const VectorRecord *a, const VectorRecord *b)
-                  {
-                      return a->getId() < b->getId();
-                  });
+        std::sort(sortedIds.begin(), sortedIds.end());
 
-        dimension_ = ordered.front()->dimension();
+        dimension_ = records.at(sortedIds[0]).dimension();
 
-        for (const VectorRecord *record : ordered)
+        // Store a normalized copy of every vector.
+        for (const std::string &id : sortedIds)
         {
-            if (record->dimension() != dimension_)
+            const VectorRecord &record = records.at(id);
+            if (record.dimension() != dimension_)
             {
                 throw std::invalid_argument("Collection contains vectors of differing dimensions");
             }
 
-            std::vector<double> values = record->getValues();
+            std::vector<double> values = record.getValues();
             if (!normalize(values))
             {
-                continue; // zero vector: no direction to cluster on
+                continue; // skip zero vectors
             }
 
-            position_[record->getId()] = ids_.size();
-            ids_.push_back(record->getId());
-            vectors_.push_back(std::move(values));
+            position_[id] = ids_.size();
+            ids_.push_back(id);
+            vectors_.push_back(values);
         }
 
-        const std::size_t n = vectors_.size();
+        std::size_t n = vectors_.size();
         if (n == 0)
         {
             return;
@@ -154,21 +197,236 @@ namespace vectordb
         }
         nlist = std::clamp<std::size_t>(nlist, 1, n);
 
+        // k-means: pick starting centroids, then repeat
+        // "assign each vector to its nearest centroid" and "move each centroid
+        // to the middle of its vectors" until nothing changes.
         seedCentroids(nlist, seed);
-        assignment_.assign(n, kUnassigned);
+        assignment_.assign(n, kNone);
 
-        for (std::size_t iteration = 0; iteration < kMaxIterations; ++iteration)
+        for (std::size_t round = 0; round < kMaxIterations; round++)
         {
-            if (!assignStep())
+            bool changed = assignStep();
+            if (!changed)
             {
-                break; // converged: no vector changed cluster
+                break;
             }
             updateStep();
         }
 
-        materializeLists();
+        buildMemberLists();
         computeRadii();
     }
+
+    // k-means++: the first centroid is a random vector. Each next one is also
+    // random, but vectors far from the centroids picked so far are more likely
+    // to be chosen. This spreads the starting centroids out.
+    void IVFIndex::seedCentroids(std::size_t nlist, unsigned seed)
+    {
+        std::size_t n = vectors_.size();
+        std::mt19937 random(seed);
+        std::uniform_int_distribution<std::size_t> randomVector(0, n - 1);
+
+        clusters_.assign(nlist, Cluster{});
+        clusters_[0].centroid = vectors_[randomVector(random)];
+
+        // nearest[i] = distance from vector i to its closest chosen centroid
+        std::vector<double> nearest(n);
+        for (std::size_t i = 0; i < n; i++)
+        {
+            nearest[i] = distance(vectors_[i], clusters_[0].centroid);
+        }
+
+        for (std::size_t c = 1; c < nlist; c++)
+        {
+            // Each vector's chance of being picked is distance squared.
+            // runningTotal[i] = sum of the chances of vectors 0..i
+            std::vector<double> runningTotal(n);
+            double total = 0.0;
+            for (std::size_t i = 0; i < n; i++)
+            {
+                total += nearest[i] * nearest[i];
+                runningTotal[i] = total;
+            }
+
+            std::size_t chosen = 0;
+            if (total == 0.0)
+            {
+                // Every vector already sits on a centroid, so any pick is as good.
+                chosen = randomVector(random);
+            }
+            else
+            {
+                // Pick a random point in [0, total) and find whose range it falls in.
+                double target = std::uniform_real_distribution<double>(0.0, total)(random);
+                chosen = kNone;
+                for (std::size_t i = 0; i < n; i++)
+                {
+                    if (runningTotal[i] > target)
+                    {
+                        chosen = i;
+                        break;
+                    }
+                }
+                if (chosen == kNone)
+                {
+                    // Rounding put target at the very end: take the last vector with a chance.
+                    for (std::size_t i = 0; i < n; i++)
+                    {
+                        if (runningTotal[i] >= total)
+                        {
+                            chosen = i;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            clusters_[c].centroid = vectors_[chosen];
+
+            for (std::size_t i = 0; i < n; i++)
+            {
+                nearest[i] = std::min(nearest[i], distance(vectors_[i], clusters_[c].centroid));
+            }
+        }
+    }
+
+    // Index of the centroid with the highest dot product with vec.
+    std::size_t IVFIndex::nearestCluster(const std::vector<double> &vec) const
+    {
+        std::size_t best = 0;
+        double bestScore = -std::numeric_limits<double>::infinity();
+        for (std::size_t c = 0; c < clusters_.size(); c++)
+        {
+            double score = dot(vec, clusters_[c].centroid);
+            if (score > bestScore)
+            {
+                bestScore = score;
+                best = c;
+            }
+        }
+        return best;
+    }
+
+    // Puts every vector in its nearest cluster. Returns true if any vector moved.
+    bool IVFIndex::assignStep()
+    {
+        bool changed = false;
+        for (std::size_t i = 0; i < vectors_.size(); i++)
+        {
+            std::size_t best = nearestCluster(vectors_[i]);
+            if (assignment_[i] != best)
+            {
+                assignment_[i] = best;
+                changed = true;
+            }
+        }
+        return changed;
+    }
+
+    // Moves every centroid to the average direction of its vectors.
+    void IVFIndex::updateStep()
+    {
+        std::size_t nlist = clusters_.size();
+        std::vector<std::vector<double>> sums(nlist, std::vector<double>(dimension_, 0.0));
+        std::vector<std::size_t> counts(nlist, 0);
+
+        for (std::size_t i = 0; i < vectors_.size(); i++)
+        {
+            std::size_t c = assignment_[i];
+            counts[c]++;
+            for (std::size_t d = 0; d < dimension_; d++)
+            {
+                sums[c][d] += vectors_[i][d];
+            }
+        }
+
+        for (std::size_t c = 0; c < nlist; c++)
+        {
+            if (counts[c] == 0)
+            {
+                continue; // empty clusters are fixed below
+            }
+            // Normalize the sum to get the average direction. If the vectors
+            // cancel out to zero, keep the old centroid.
+            std::vector<double> mean = sums[c];
+            if (normalize(mean))
+            {
+                clusters_[c].centroid = mean;
+            }
+        }
+
+        // An empty cluster is useless. Give it the vector that is farthest
+        // from its own centroid, but never take the last vector of a cluster.
+        for (std::size_t c = 0; c < nlist; c++)
+        {
+            if (counts[c] > 0)
+            {
+                continue;
+            }
+
+            std::size_t worst = kNone;
+            double worstScore = std::numeric_limits<double>::infinity();
+            for (std::size_t i = 0; i < vectors_.size(); i++)
+            {
+                std::size_t owner = assignment_[i];
+                if (counts[owner] < 2)
+                {
+                    continue;
+                }
+                double score = dot(vectors_[i], clusters_[owner].centroid);
+                if (score < worstScore)
+                {
+                    worstScore = score;
+                    worst = i;
+                }
+            }
+
+            if (worst == kNone)
+            {
+                continue; // every cluster has one vector, nothing to give
+            }
+
+            counts[assignment_[worst]]--;
+            assignment_[worst] = c;
+            counts[c] = 1;
+            clusters_[c].centroid = vectors_[worst];
+        }
+    }
+
+    // Fills each cluster's member list from assignment_.
+    void IVFIndex::buildMemberLists()
+    {
+        for (Cluster &cluster : clusters_)
+        {
+            cluster.members.clear();
+        }
+        for (std::size_t i = 0; i < vectors_.size(); i++)
+        {
+            clusters_[assignment_[i]].members.push_back(i);
+        }
+    }
+
+    // Radius = angle from the centroid to the farthest member.
+    // The farthest member is the one with the smallest dot product.
+    void IVFIndex::computeRadii()
+    {
+        for (Cluster &cluster : clusters_)
+        {
+            double smallestDot = 1.0;
+            for (std::size_t i : cluster.members)
+            {
+                smallestDot = std::min(smallestDot, dot(cluster.centroid, vectors_[i]));
+            }
+
+            // Widen a tiny bit for rounding errors.
+            cluster.cosRadius = std::clamp(smallestDot - kRadiusSlack, -1.0, 1.0);
+            cluster.sinRadius = std::sqrt(std::max(0.0, 1.0 - cluster.cosRadius * cluster.cosRadius));
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Adding and removing single vectors
+    // ------------------------------------------------------------------
 
     bool IVFIndex::add(const std::string &id, const std::vector<double> &values)
     {
@@ -177,75 +435,68 @@ namespace vectordb
             return false;
         }
 
-        remove(id); // replacing: the old vector must not linger in its cluster
+        remove(id); // if this id is already here, drop the old vector first
 
-        std::vector<double> normalized = values;
-        if (!normalize(normalized))
+        std::vector<double> vec = values;
+        if (!normalize(vec))
         {
-            return true; // zero vector: excluded, exactly as build excludes it
+            return true; // zero vector: not stored, same as in build()
         }
 
-        // Nearest centroid, with the same rule and tie-break as assignStep.
-        double bestScore = -std::numeric_limits<double>::infinity();
-        std::size_t best = 0;
-        for (std::size_t c = 0; c < clusters_.size(); ++c)
-        {
-            const double score = dot(normalized, clusters_[c].centroid);
-            if (score > bestScore)
-            {
-                bestScore = score;
-                best = c;
-            }
-        }
+        std::size_t c = nearestCluster(vec);
+        double score = dot(vec, clusters_[c].centroid);
 
-        const std::size_t index = vectors_.size();
-        vectors_.push_back(std::move(normalized));
+        std::size_t index = vectors_.size();
+        vectors_.push_back(vec);
         ids_.push_back(id);
-        assignment_.push_back(best);
+        assignment_.push_back(c);
         position_[id] = index;
+        clusters_[c].members.push_back(index);
 
-        Cluster &cluster = clusters_[best];
-        cluster.members.push_back(index);
-
-        // The bound is only correct while every member lies inside the cone,
-        // so a vector outside it must widen it now, with the same slack as
-        // computeRadii.
-        const double cosRadius = std::clamp(bestScore - kRadiusSlack, -1.0, 1.0);
-        if (cosRadius < cluster.cosRadius)
+        // If the new vector is outside the cluster's radius, widen the radius.
+        // Otherwise the bound would be too low and search could skip this
+        // cluster by mistake.
+        double newCos = std::clamp(score - kRadiusSlack, -1.0, 1.0);
+        if (newCos < clusters_[c].cosRadius)
         {
-            cluster.cosRadius = cosRadius;
-            cluster.sinRadius = std::sqrt(std::max(0.0, 1.0 - cosRadius * cosRadius));
+            clusters_[c].cosRadius = newCos;
+            clusters_[c].sinRadius = std::sqrt(std::max(0.0, 1.0 - newCos * newCos));
         }
-
         return true;
     }
 
     bool IVFIndex::remove(const std::string &id)
     {
-        const auto found = position_.find(id);
-        if (found == position_.end())
+        if (position_.count(id) == 0)
         {
             return false;
         }
 
-        const std::size_t index = found->second;
-        position_.erase(found);
+        std::size_t index = position_[id];
+        position_.erase(id);
 
+        // Take it out of its cluster's member list.
         std::vector<std::size_t> &members = clusters_[assignment_[index]].members;
         members.erase(std::find(members.begin(), members.end(), index));
 
-        // Fill the hole with the last vector so no other flat index shifts;
-        // only the moved vector's entry in its own cluster needs fixing.
-        const std::size_t last = vectors_.size() - 1;
+        // Move the last vector into the empty spot, so no other positions change.
+        std::size_t last = vectors_.size() - 1;
         if (index != last)
         {
-            vectors_[index] = std::move(vectors_[last]);
-            ids_[index] = std::move(ids_[last]);
+            vectors_[index] = vectors_[last];
+            ids_[index] = ids_[last];
             assignment_[index] = assignment_[last];
             position_[ids_[index]] = index;
 
-            std::vector<std::size_t> &moved = clusters_[assignment_[index]].members;
-            *std::find(moved.begin(), moved.end(), last) = index;
+            // Its cluster still lists it at the old position; fix that.
+            std::vector<std::size_t> &movedMembers = clusters_[assignment_[index]].members;
+            for (std::size_t &member : movedMembers)
+            {
+                if (member == last)
+                {
+                    member = index;
+                }
+            }
         }
 
         vectors_.pop_back();
@@ -254,210 +505,9 @@ namespace vectordb
         return true;
     }
 
-    void IVFIndex::seedCentroids(std::size_t nlist, unsigned seed)
-    {
-        // k-means++: the first centroid is uniform, each later one is drawn with
-        // probability proportional to its squared distance from the nearest
-        // centroid chosen so far. Points near an existing centroid are almost
-        // never picked again, so the seeds spread across the natural groups
-        // instead of doubling up in one and leaving another to be merged.
-        std::mt19937 generator(seed);
-        std::uniform_int_distribution<std::size_t> anyVector(0, vectors_.size() - 1);
-
-        clusters_.assign(nlist, Cluster{});
-        clusters_[0].centroid = vectors_[anyVector(generator)];
-
-        // Vectors are unit length, so 1 - dot is a distance in [0, 2]. It is
-        // monotone in the angle, which is all the weighting needs.
-        const auto distance = [](const std::vector<double> &a, const std::vector<double> &b)
-        {
-            return std::max(0.0, 1.0 - dot(a, b));
-        };
-
-        std::vector<double> nearest(vectors_.size());
-        for (std::size_t i = 0; i < vectors_.size(); ++i)
-        {
-            nearest[i] = distance(vectors_[i], clusters_[0].centroid);
-        }
-
-        std::vector<double> cumulative(vectors_.size());
-
-        for (std::size_t c = 1; c < nlist; ++c)
-        {
-            double total = 0.0;
-            for (std::size_t i = 0; i < vectors_.size(); ++i)
-            {
-                total += nearest[i] * nearest[i];
-                cumulative[i] = total;
-            }
-
-            std::size_t chosen;
-            if (total == 0.0)
-            {
-                // Every vector already sits on a centroid: there are fewer
-                // distinct directions than clusters. Any pick duplicates one,
-                // and updateStep reseeds the cluster that ends up empty.
-                chosen = anyVector(generator);
-            }
-            else
-            {
-                // The first prefix sum above the draw lands on a vector with
-                // nonzero weight. A draw that rounds up to total falls back to
-                // the first vector that reaches total, which also has weight.
-                const double target = std::uniform_real_distribution<double>(0.0, total)(generator);
-                auto it = std::upper_bound(cumulative.begin(), cumulative.end(), target);
-                if (it == cumulative.end())
-                {
-                    it = std::lower_bound(cumulative.begin(), cumulative.end(), total);
-                }
-                chosen = static_cast<std::size_t>(it - cumulative.begin());
-            }
-
-            clusters_[c].centroid = vectors_[chosen];
-
-            for (std::size_t i = 0; i < vectors_.size(); ++i)
-            {
-                nearest[i] = std::min(nearest[i], distance(vectors_[i], clusters_[c].centroid));
-            }
-        }
-    }
-
-    bool IVFIndex::assignStep()
-    {
-        bool changed = false;
-
-        for (std::size_t i = 0; i < vectors_.size(); ++i)
-        {
-            double bestScore = -std::numeric_limits<double>::infinity();
-            std::size_t bestCluster = 0;
-
-            for (std::size_t c = 0; c < clusters_.size(); ++c)
-            {
-                const double score = dot(vectors_[i], clusters_[c].centroid);
-                if (score > bestScore)
-                {
-                    bestScore = score;
-                    bestCluster = c;
-                }
-            }
-
-            if (assignment_[i] != bestCluster)
-            {
-                assignment_[i] = bestCluster;
-                changed = true;
-            }
-        }
-
-        return changed;
-    }
-
-    void IVFIndex::updateStep()
-    {
-        const std::size_t nlist = clusters_.size();
-
-        std::vector<std::vector<double>> sums(nlist, std::vector<double>(dimension_, 0.0));
-        std::vector<std::size_t> counts(nlist, 0);
-
-        for (std::size_t i = 0; i < vectors_.size(); ++i)
-        {
-            const std::size_t c = assignment_[i];
-            ++counts[c];
-            for (std::size_t d = 0; d < dimension_; ++d)
-            {
-                sums[c][d] += vectors_[i][d];
-            }
-        }
-
-        for (std::size_t c = 0; c < nlist; ++c)
-        {
-            if (counts[c] == 0)
-            {
-                continue; // handled below
-            }
-
-            // Spherical k-means: the centroid is a direction, so the mean is
-            // pushed back onto the unit sphere. A mean that cancels out to zero
-            // keeps its previous centroid.
-            std::vector<double> mean = sums[c];
-            if (normalize(mean))
-            {
-                clusters_[c].centroid = std::move(mean);
-            }
-        }
-
-        // An empty cluster has no centroid to speak of and would silently leave
-        // us with fewer than nlist clusters. Reseed it to the point currently
-        // worst served by its own centroid, taking care not to empty the donor.
-        for (std::size_t c = 0; c < nlist; ++c)
-        {
-            if (counts[c] > 0)
-            {
-                continue;
-            }
-
-            double worstScore = std::numeric_limits<double>::infinity();
-            std::size_t worstIndex = kUnassigned;
-
-            for (std::size_t i = 0; i < vectors_.size(); ++i)
-            {
-                const std::size_t owner = assignment_[i];
-                if (counts[owner] < 2)
-                {
-                    continue;
-                }
-
-                const double score = dot(vectors_[i], clusters_[owner].centroid);
-                if (score < worstScore)
-                {
-                    worstScore = score;
-                    worstIndex = i;
-                }
-            }
-
-            if (worstIndex == kUnassigned)
-            {
-                continue; // every cluster is a singleton; nothing to donate
-            }
-
-            --counts[assignment_[worstIndex]];
-            assignment_[worstIndex] = c;
-            counts[c] = 1;
-            clusters_[c].centroid = vectors_[worstIndex];
-        }
-    }
-
-    void IVFIndex::materializeLists()
-    {
-        for (Cluster &cluster : clusters_)
-        {
-            cluster.members.clear();
-        }
-
-        for (std::size_t i = 0; i < vectors_.size(); ++i)
-        {
-            clusters_[assignment_[i]].members.push_back(i);
-        }
-    }
-
-    void IVFIndex::computeRadii()
-    {
-        for (Cluster &cluster : clusters_)
-        {
-            // The widest member angle is the one with the smallest dot product.
-            // Starting at 1.0 rather than the first member keeps an empty cluster
-            // (which no bound can get wrong) well defined.
-            double minDot = 1.0;
-            for (std::size_t index : cluster.members)
-            {
-                minDot = std::min(minDot, dot(cluster.centroid, vectors_[index]));
-            }
-
-            // Inflate once, here, and derive the sine from the inflated cosine so
-            // the two describe the same widened cone.
-            cluster.cosRadius = std::clamp(minDot - kRadiusSlack, -1.0, 1.0);
-            cluster.sinRadius = std::sqrt(std::max(0.0, 1.0 - cluster.cosRadius * cluster.cosRadius));
-        }
-    }
+    // ------------------------------------------------------------------
+    // Bounds
+    // ------------------------------------------------------------------
 
     std::vector<double> IVFIndex::normalizedQuery(const std::vector<double> &query) const
     {
@@ -465,97 +515,105 @@ namespace vectordb
         {
             throw std::invalid_argument("Query vector dimension does not match collection vectors");
         }
-
-        std::vector<double> normalized = query;
-        if (!normalize(normalized))
+        std::vector<double> q = query;
+        if (!normalize(q))
         {
             throw std::invalid_argument("Zero vector is not allowed");
         }
-        return normalized;
+        return q;
     }
 
+    // Best possible score in the cluster: cos(angle to centroid - radius).
+    // We use cos(a - b) = cos a * cos b + sin a * sin b, so no angles are needed.
     double IVFIndex::upperBound(double queryCentroidDot, const Cluster &cluster) const
     {
-        // With θq the query-centroid angle and R the cluster radius, no member is
-        // closer to the query than θq − R, so no member scores above cos(θq − R).
-        // Expanding the angle difference keeps this in cosine space: acos is
-        // ill-conditioned as the dot product approaches 1, which is exactly the
-        // tight-cluster case.
-        const double cq = std::clamp(queryCentroidDot, -1.0, 1.0);
+        double cosA = std::clamp(queryCentroidDot, -1.0, 1.0);
 
-        if (cq >= cluster.cosRadius)
+        if (cosA >= cluster.cosRadius)
         {
-            return 1.0; // the query sits inside the cluster's cone
+            return 1.0; // the query is inside the cluster's radius
         }
 
-        return cq * cluster.cosRadius + std::sqrt(std::max(0.0, 1.0 - cq * cq)) * cluster.sinRadius;
+        double sinA = std::sqrt(std::max(0.0, 1.0 - cosA * cosA));
+        return cosA * cluster.cosRadius + sinA * cluster.sinRadius;
     }
 
     double IVFIndex::upperBound(const std::vector<double> &query, std::size_t cluster) const
     {
-        const Cluster &target = clusters_.at(cluster);
-        return upperBound(dot(normalizedQuery(query), target.centroid), target);
+        const Cluster &c = clusters_.at(cluster);
+        return upperBound(dot(normalizedQuery(query), c.centroid), c);
     }
 
+    // Used to sort clusters: highest bound first. On equal bounds, the
+    // nearer centroid first, then the lower cluster number.
+    bool IVFIndex::scanBefore(const ClusterBound &a, const ClusterBound &b)
+    {
+        if (a.bound != b.bound)
+        {
+            return a.bound > b.bound;
+        }
+        if (a.centroidDot != b.centroidDot)
+        {
+            return a.centroidDot > b.centroidDot;
+        }
+        return a.cluster < b.cluster;
+    }
+
+    // All clusters with their bounds, sorted so the highest bound comes first.
     std::vector<IVFIndex::ClusterBound> IVFIndex::scanOrder(const std::vector<double> &query) const
     {
         std::vector<ClusterBound> order;
-        order.reserve(clusters_.size());
-
-        for (std::size_t c = 0; c < clusters_.size(); ++c)
+        for (std::size_t c = 0; c < clusters_.size(); c++)
         {
-            const double centroidDot = dot(query, clusters_[c].centroid);
+            double centroidDot = dot(query, clusters_[c].centroid);
             order.push_back({upperBound(centroidDot, clusters_[c]), centroidDot, c});
         }
-
-        // Bound descending is what the stopping rule needs: every unscanned
-        // cluster is then bounded by the next one in line. Among equal bounds,
-        // typically several clusters whose cone contains the query, the nearest
-        // centroid goes first; the cluster index makes the order deterministic.
-        std::sort(order.begin(), order.end(),
-                  [](const ClusterBound &a, const ClusterBound &b)
-                  {
-                      if (a.bound != b.bound)
-                      {
-                          return a.bound > b.bound;
-                      }
-                      if (a.centroidDot != b.centroidDot)
-                      {
-                          return a.centroidDot > b.centroidDot;
-                      }
-                      return a.cluster < b.cluster;
-                  });
-
+        std::sort(order.begin(), order.end(), scanBefore);
         return order;
     }
 
+    // ------------------------------------------------------------------
+    // Search
+    // ------------------------------------------------------------------
+
+    // How many clusters an ambiguous query should be allowed to scan.
+    // If the top two bounds are far apart, the query clearly belongs to one
+    // cluster: 1 is enough. The closer they are, the more clusters (up to 8).
     std::size_t IVFIndex::adaptiveProbeFloor(const std::vector<ClusterBound> &order) const
     {
-        // The bound can be too loose to ever fire: in high dimensions every
-        // cluster's cone is wide and every bound sits near 1, so the probe cap
-        // decides recall on its own. The gap between the best bound and the
-        // runner-up says how much that cap matters. A wide gap means the query
-        // sits unambiguously in one cluster and one probe is plenty; a gap near
-        // zero means it straddles several cones, any of which may hold the
-        // answer, and scanning only the first is a coin toss.
-        //
-        // Deliberately one small function: the shape of the ramp is a heuristic
-        // and the place to tune it should be obvious.
         if (order.size() < 2)
         {
             return 1;
         }
 
-        const double gap = order[0].bound - order[1].bound;
+        double gap = order[0].bound - order[1].bound;
         if (gap >= kAmbiguityGap)
         {
             return 1;
         }
 
-        // Linear ramp: 1 probe at the full gap, kMaxProbeFloor at no gap at all.
-        const double ambiguity = 1.0 - std::max(0.0, gap) / kAmbiguityGap;
-        const double extra = ambiguity * static_cast<double>(kMaxProbeFloor - 1);
+        // gap 0.05 -> 1 cluster ... gap 0 -> 8 clusters
+        double ambiguity = 1.0 - std::max(0.0, gap) / kAmbiguityGap;
+        double extra = ambiguity * (kMaxProbeFloor - 1);
         return 1 + static_cast<std::size_t>(std::llround(extra));
+    }
+
+    // Most clusters this search may scan.
+    std::size_t IVFIndex::clusterLimit(const SearchParams &params,
+                                       const std::vector<ClusterBound> &order) const
+    {
+        if (params.maxProbes == 0)
+        {
+            return order.size(); // no limit
+        }
+
+        std::size_t limit = params.maxProbes;
+        if (params.minProbes > 0)
+        {
+            limit = std::max(limit, params.minProbes);
+            limit = std::max(limit, adaptiveProbeFloor(order));
+        }
+        return std::min(limit, order.size());
     }
 
     SearchResponse IVFIndex::search(const std::vector<double> &query, std::size_t k) const
@@ -579,169 +637,131 @@ namespace vectordb
                                                std::size_t k,
                                                std::size_t nprobe) const
     {
-        // A caller who names an exact probe count gets it: minProbes = 0 keeps
-        // the adaptive floor from widening the scan behind their back.
+        // minProbes = 0: scan at most nprobe clusters, never more.
         SearchParams params;
         params.minProbes = 0;
         params.maxProbes = std::max<std::size_t>(nprobe, 1);
         return scan(query, k, params).results;
     }
 
+    // The search loop that every search() above uses.
     SearchResponse IVFIndex::scan(const std::vector<double> &query,
                                   std::size_t k,
                                   const SearchParams &params) const
     {
-        const auto start = std::chrono::steady_clock::now();
+        Clock::time_point start = Clock::now();
 
         SearchResponse response;
-        SearchStats &stats = response.stats;
-        stats.totalClusters = clusters_.size();
-        stats.totalVectors = vectors_.size();
+        response.stats.totalClusters = clusters_.size();
+        response.stats.totalVectors = vectors_.size();
 
-        const auto finish = [&](SearchStatus status)
+        if (vectors_.empty() || k == 0)
         {
-            stats.status = status;
-            stats.elapsedMs = std::chrono::duration<double, std::milli>(
-                                  std::chrono::steady_clock::now() - start)
-                                  .count();
-            return std::move(response);
-        };
-
-        if (vectors_.empty())
-        {
-            return finish(SearchStatus::Exhausted);
-        }
-        if (k == 0)
-        {
-            return finish(SearchStatus::Certified); // the empty answer needs no scan
+            // Nothing to search. With k = 0 the empty answer is already exact.
+            response.stats.status = vectors_.empty() ? SearchStatus::Exhausted : SearchStatus::Certified;
+            response.stats.elapsedMs = millisecondsSince(start);
+            return response;
         }
 
-        const std::vector<double> normalized = normalizedQuery(query);
-        const std::vector<ClusterBound> order = scanOrder(normalized);
+        // 1. Compute every cluster's bound and sort, highest first.
+        std::vector<double> q = normalizedQuery(query);
+        std::vector<ClusterBound> order = scanOrder(q);
+        std::size_t maxClusters = clusterLimit(params, order);
 
-        // The floor only ever acts through the cap: it cannot delay a
-        // certificate, and with no cap at all it is a no-op. So raising it is
-        // safe for exactness and only spends time where recall needs it.
-        std::size_t probeFloor = params.minProbes;
-        if (probeFloor > 0)
-        {
-            probeFloor = std::max(probeFloor, adaptiveProbeFloor(order));
-        }
-        const std::size_t probeLimit =
-            params.maxProbes == 0
-                ? order.size()
-                : std::min(order.size(), std::max(params.maxProbes, probeFloor));
-
-        // Scanning best-bound-first is what makes the deadline safe: the answer
-        // only improves as clusters are added, so cutting the scan short
-        // degrades recall gracefully instead of returning garbage.
-        const bool timed = params.deadline.count() > 0;
-        const auto outOfTime = [&, start]
-        {
-            return timed && std::chrono::steady_clock::now() - start >= params.deadline;
-        };
-
-        struct Candidate
-        {
-            double score;
-            std::size_t index;
-        };
-
-        // Ranks a candidate against another: higher score wins, ties break on
-        // the smaller id so results stay deterministic. Used as the comparator
-        // of a priority_queue, which puts the *lowest*-ranked candidate on top —
-        // exactly the one to evict once the heap holds more than k.
-        const auto better = [this](const Candidate &a, const Candidate &b)
-        {
-            if (a.score != b.score)
-            {
-                return a.score > b.score;
-            }
-            return ids_[a.index] < ids_[b.index];
-        };
-
-        std::priority_queue<Candidate, std::vector<Candidate>, decltype(better)> heap(better);
-
+        // 2. Scan clusters in that order, keeping the best k in a heap.
+        //    The heap's top is always the worst of the current top k.
+        std::priority_queue<Candidate, std::vector<Candidate>, WorstOnTop> topK;
         SearchStatus status = SearchStatus::Exhausted;
-        bool interrupted = false;
 
-        for (std::size_t next = 0; next < order.size();)
+        for (std::size_t i = 0; i < order.size(); i++)
         {
-            if (next == probeLimit)
+            if (i == maxClusters)
             {
                 status = SearchStatus::BudgetHit;
                 break;
             }
 
-            const Cluster &cluster = clusters_[order[next].cluster];
-            std::size_t sinceClockRead = 0;
+            const Cluster &cluster = clusters_[order[i].cluster];
+            bool outOfTime = false;
+            std::size_t scannedHere = 0;
 
             for (std::size_t index : cluster.members)
             {
-                heap.push({dot(normalized, vectors_[index]), index});
-                if (heap.size() > k)
-                {
-                    heap.pop();
-                }
-                ++stats.vectorsScanned;
+                double score = dot(q, vectors_[index]);
 
-                // One cluster can hold a large share of the data, so the clock
-                // is read inside the scan as well as at the boundaries. The
-                // stride always completes, so there is always something to
-                // return by the time this can fire.
-                if (++sinceClockRead == kDeadlineCheckStride)
+                if (topK.size() < k)
                 {
-                    sinceClockRead = 0;
-                    if (outOfTime())
+                    topK.push({score, ids_[index]});
+                }
+                else
+                {
+                    // Full: keep the new one only if it beats the current worst.
+                    const Candidate &worst = topK.top();
+                    if (score > worst.score || (score == worst.score && ids_[index] < worst.id))
                     {
-                        interrupted = true;
-                        break;
+                        topK.pop();
+                        topK.push({score, ids_[index]});
                     }
+                }
+                response.stats.vectorsScanned++;
+
+                // A cluster can be huge, so check the clock inside it too.
+                scannedHere++;
+                if (scannedHere % kDeadlineCheckStride == 0 && timeIsUp(start, params.deadline))
+                {
+                    outOfTime = true;
+                    break;
                 }
             }
 
-            if (interrupted)
+            if (outOfTime)
             {
-                // This cluster was left part-scanned, so it does not count as
-                // scanned; the vectors from it already do.
-                status = SearchStatus::DeadlineHit;
+                status = SearchStatus::DeadlineHit; // this cluster is not counted as scanned
                 break;
             }
 
-            ++next;
-            ++stats.clustersScanned;
+            response.stats.clustersScanned++;
 
-            // Every unscanned cluster is bounded by order[next].bound. Once the
-            // k-th best score strictly clears that bound, no unscanned vector can
-            // match it, let alone outrank it on the id tie-break. The check needs
-            // a full heap: with fewer than k candidates there is no k-th score.
-            if (next < order.size() && heap.size() == k &&
-                heap.top().score > order[next].bound + kBoundEpsilon)
+            bool lastCluster = (i + 1 == order.size());
+            if (lastCluster)
+            {
+                break; // scanned everything: status stays Exhausted
+            }
+
+            // 3. Can we stop? Every cluster left has a bound no higher than the
+            //    next one's. If our k-th best score is above that, nothing left
+            //    can get into the top k, so the answer is proven exact.
+            double nextBound = order[i + 1].bound;
+            if (topK.size() == k && topK.top().score > nextBound + kBoundEpsilon)
             {
                 status = SearchStatus::Certified;
                 break;
             }
 
-            // Checked after the certificate, so a proven answer is never
-            // reported as a timeout, and only with something in hand, so the
-            // deadline cannot turn into an empty result.
-            if (next < order.size() && !heap.empty() && outOfTime())
+            // Only give up on time once we have something to return.
+            if (!topK.empty() && timeIsUp(start, params.deadline))
             {
                 status = SearchStatus::DeadlineHit;
                 break;
             }
         }
 
-        // The heap drains worst-first, so fill back to front.
-        response.results.resize(heap.size());
-        for (std::size_t i = heap.size(); i-- > 0;)
+        // 4. Empty the heap. It gives the worst first, so fill from the back.
+        response.results.resize(topK.size());
+        for (std::size_t i = topK.size(); i > 0; i--)
         {
-            response.results[i] = {ids_[heap.top().index], heap.top().score};
-            heap.pop();
+            response.results[i - 1] = {topK.top().id, topK.top().score};
+            topK.pop();
         }
 
-        return finish(status);
+        response.stats.status = status;
+        response.stats.elapsedMs = millisecondsSince(start);
+        return response;
     }
+
+    // ------------------------------------------------------------------
+    // Getters
+    // ------------------------------------------------------------------
 
     std::size_t IVFIndex::size() const
     {

@@ -12,6 +12,20 @@ using json = nlohmann::json;
 namespace vectordb
 {
 
+    namespace
+    {
+        // Higher score first. Equal scores: smaller id first.
+        // IVF search uses the same order, so their results can be compared.
+        bool byScoreThenId(const SearchResult &a, const SearchResult &b)
+        {
+            if (a.score != b.score)
+            {
+                return a.score > b.score;
+            }
+            return a.id < b.id;
+        }
+    }
+
     Collection::Collection(const std::string &name) : name_(name)
     {
         if (name_.empty())
@@ -25,16 +39,17 @@ namespace vectordb
         return name_;
     }
 
-    /// Adds the record, or replaces the one with the same id. Every vector in a
-    /// collection must have the same length; a mismatch throws. The only
-    /// exception is replacing the collection's sole record, which may change it.
+    // Adds a record, or replaces the record with the same id.
+    // All vectors must have the same length. The one exception: if the record
+    // being replaced is the only one, the new one may have any length.
     void Collection::insert(const VectorRecord &record)
     {
-        for (const auto &[id, existing] : records_)
+        for (const auto &entry : records_)
         {
-            if (id == record.getId())
+            const VectorRecord &existing = entry.second;
+            if (existing.getId() == record.getId())
             {
-                continue; // being replaced, so its length does not count
+                continue; // this one is being replaced, so skip it
             }
             if (existing.dimension() != record.dimension())
             {
@@ -43,53 +58,55 @@ namespace vectordb
                     " does not match collection '" + name_ + "' length " +
                     std::to_string(existing.dimension()));
             }
-            break; // all stored vectors share one length, so one check suffices
+            break; // all vectors have the same length, so checking one is enough
         }
 
         records_[record.getId()] = record;
 
-        // add() replaces a vector with the same id, so a replacement is one
-        // change, not two. It refuses only what it cannot place (such as the
-        // sole record changing dimension); rebuilding handles that.
-        if (IVFIndex *index = indexForUpdate())
+        IVFIndex *index = indexForUpdate();
+        if (index != nullptr)
         {
-            if (!index->add(record.getId(), record.getValues()))
+            bool added = index->add(record.getId(), record.getValues());
+            if (!added)
             {
-                indexDirty_ = true;
+                indexDirty_ = true; // could not add it, so rebuild instead
             }
         }
     }
 
     bool Collection::remove(const std::string &id)
     {
-        const bool removed = records_.erase(id) > 0;
-        if (removed)
+        if (records_.erase(id) == 0)
         {
-            if (IVFIndex *index = indexForUpdate())
-            {
-                index->remove(id);
-            }
+            return false; // no such id
         }
-        return removed;
+
+        IVFIndex *index = indexForUpdate();
+        if (index != nullptr)
+        {
+            index->remove(id);
+        }
+        return true;
     }
 
     IVFIndex *Collection::indexForUpdate()
     {
-        if (indexDirty_ || !index_)
+        if (index_ == nullptr || indexDirty_)
         {
-            return nullptr; // the next IVF search rebuilds from the records anyway
+            return nullptr; // it will be rebuilt from records_ on the next search anyway
         }
 
-        ++changesSinceBuild_;
-        if (static_cast<double>(changesSinceBuild_) > kRebuildChurn * static_cast<double>(sizeAtBuild_))
+        changesSinceBuild_++;
+        if (changesSinceBuild_ > kRebuildChurn * sizeAtBuild_)
         {
+            // Too many changes: the clusters are getting stale. Rebuild later.
             indexDirty_ = true;
-            index_.reset();
+            index_ = nullptr;
             return nullptr;
         }
 
-        // A copy of this collection may share the index; give this one its own
-        // before changing it, so the copy keeps searching its own records.
+        // When a Collection is copied, both copies point to the same index.
+        // Before changing it, make our own copy so the other one is not affected.
         if (index_.use_count() > 1)
         {
             index_ = std::make_shared<IVFIndex>(*index_);
@@ -103,8 +120,9 @@ namespace vectordb
         j["name"] = name_;
         j["records"] = json::array();
 
-        for (const auto &[id, record] : records_)
+        for (const auto &entry : records_)
         {
+            const VectorRecord &record = entry.second;
             j["records"].push_back({{"id", record.getId()},
                                     {"values", record.getValues()}});
         }
@@ -148,54 +166,39 @@ namespace vectordb
             return {};
         }
 
-        const auto &firstRecord = records_.begin()->second;
-        if (query.size() != firstRecord.dimension())
+        const VectorRecord &first = records_.begin()->second;
+        if (query.size() != first.dimension())
         {
             throw std::invalid_argument("Query vector dimension does not match collection vectors");
         }
 
+        // Score every record.
         std::vector<SearchResult> results;
-        results.reserve(records_.size());
-
-        for (const auto &[id, record] : records_)
+        for (const auto &entry : records_)
         {
-            double score = cosineSimilarity(query, record.getValues());
-            results.push_back({id, score});
+            double score = cosineSimilarity(query, entry.second.getValues());
+            results.push_back({entry.first, score});
         }
 
-        // Score descending, then id ascending. Record iteration order is
-        // unspecified, so without the id tie-break tied results would come out
-        // in arbitrary order. This is the same total order IVFIndex uses.
-        std::sort(results.begin(), results.end(),
-                  [](const SearchResult &a, const SearchResult &b)
-                  {
-                      if (a.score != b.score)
-                      {
-                          return a.score > b.score;
-                      }
-                      return a.id < b.id;
-                  });
-
+        // Sort best first and keep the top k.
+        std::sort(results.begin(), results.end(), byScoreThenId);
         if (k < results.size())
         {
             results.resize(k);
         }
-
         return results;
     }
 
     const IVFIndex &Collection::ivfIndex() const
     {
-        if (indexDirty_ || !index_)
+        if (index_ == nullptr || indexDirty_)
         {
-            auto index = std::make_shared<IVFIndex>();
-            index->build(records_);
-            index_ = index;
+            index_ = std::make_shared<IVFIndex>();
+            index_->build(records_);
             indexDirty_ = false;
             changesSinceBuild_ = 0;
             sizeAtBuild_ = records_.size();
         }
-
         return *index_;
     }
 
@@ -215,7 +218,6 @@ namespace vectordb
         {
             return {};
         }
-
         return ivfIndex().search(query, k, nprobe);
     }
 
@@ -232,9 +234,9 @@ namespace vectordb
     std::vector<VectorRecord> Collection::listRecords() const
     {
         std::vector<VectorRecord> records;
-        for (const auto &[id, record] : records_)
+        for (const auto &entry : records_)
         {
-            records.push_back(record);
+            records.push_back(entry.second);
         }
         return records;
     }
