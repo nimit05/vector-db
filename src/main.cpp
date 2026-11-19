@@ -13,6 +13,8 @@
 
 namespace fs = std::filesystem;
 
+/// Prints the CLI help text: the four commands (insert, search, list, delete),
+/// their arguments, and the IVF search modes accepted by `--mode`.
 static void printUsage(const std::string &programName)
 {
     std::cout << "Usage:\n";
@@ -28,6 +30,8 @@ static void printUsage(const std::string &programName)
     std::cout << "  exact         guaranteed exact; stops early only when the bound proves it\n";
 }
 
+/// Converts a `--mode` value from the command line (e.g. "balanced") into the
+/// matching SearchMode preset. Throws std::invalid_argument for unknown names.
 static vectordb::SearchMode parseSearchMode(const std::string &name)
 {
     if (name == "low_latency")
@@ -50,6 +54,8 @@ static vectordb::SearchMode parseSearchMode(const std::string &name)
                                 "' (expected low_latency, balanced, high_recall or exact)");
 }
 
+/// Returns a short, human-readable label for why an IVF search stopped
+/// (certified exact, all clusters scanned, deadline reached, or cluster budget reached).
 static std::string describeStatus(vectordb::SearchStatus status)
 {
     switch (status)
@@ -66,6 +72,8 @@ static std::string describeStatus(vectordb::SearchStatus status)
     return "unknown";
 }
 
+/// Builds the one-line summary printed after an IVF search: stop status,
+/// clusters scanned out of the total, vectors compared, and elapsed time.
 /// e.g. "[certified — scanned 2/32 clusters, 61 vectors, 0.08 ms]"
 static std::string formatStats(const vectordb::SearchStats &stats)
 {
@@ -77,11 +85,16 @@ static std::string formatStats(const vectordb::SearchStats &stats)
     return line.str();
 }
 
+/// Returns the file a collection is stored in: data/<collectionName>.json,
+/// relative to the current working directory.
 static std::string getCollectionPath(const std::string &collectionName)
 {
     return "data/" + collectionName + ".json";
 }
 
+/// Reads argv[startIndex] through the last argument as numbers and returns them
+/// as a vector. Throws if any argument is not a number (std::stod) or if there
+/// are no values at all.
 static std::vector<double> parseVectorArgs(int startIndex, int argc, char *argv[])
 {
     std::vector<double> values;
@@ -99,6 +112,8 @@ static std::vector<double> parseVectorArgs(int startIndex, int argc, char *argv[
     return values;
 }
 
+/// Loads the named collection from disk if its file exists; otherwise returns
+/// a new empty collection with that name (not saved until the caller saves it).
 static vectordb::Collection loadOrCreateCollection(const std::string &collectionName)
 {
     std::string path = getCollectionPath(collectionName);
@@ -111,6 +126,14 @@ static vectordb::Collection loadOrCreateCollection(const std::string &collection
     return vectordb::Collection(collectionName);
 }
 
+/// CLI entry point. Reads the command (insert / search / list / delete) and the
+/// collection name, then:
+///   insert - adds a vector under the given id and saves the collection
+///   search - returns the top-k matches; brute-force by default, or the IVF index
+///            when --mode is given, which also prints search stats
+///   list   - prints the id of every record in the collection
+///   delete - removes the record with the given id and saves the collection
+/// Returns 0 on success, 1 on bad usage or any error (the message goes to stderr).
 int main(int argc, char *argv[])
 {
     try

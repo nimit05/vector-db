@@ -275,6 +275,35 @@ TEST_F(CollectionTest, SearchWithMismatchedDimensionThrows)
     EXPECT_THROW(collection.searchExact(query, 1), std::invalid_argument);
 }
 
+TEST_F(CollectionTest, InsertWithMismatchedDimensionThrows)
+{
+    vectordb::Collection collection("test_col");
+    collection.insert(vectordb::VectorRecord("vec1", {1.0, 0.0, 0.0}));
+
+    EXPECT_THROW(collection.insert(vectordb::VectorRecord("vec2", {1.0, 0.0})),
+                 std::invalid_argument);
+    EXPECT_EQ(collection.listRecords().size(), 1);
+}
+
+TEST_F(CollectionTest, ReplacingOnlyRecordMayChangeDimension)
+{
+    vectordb::Collection collection("test_col");
+    collection.insert(vectordb::VectorRecord("vec1", {1.0, 0.0, 0.0}));
+
+    EXPECT_NO_THROW(collection.insert(vectordb::VectorRecord("vec1", {1.0, 0.0})));
+    EXPECT_EQ(collection.listRecords().front().dimension(), 2);
+}
+
+TEST_F(CollectionTest, ReplacingRecordMustKeepCollectionDimension)
+{
+    vectordb::Collection collection("test_col");
+    collection.insert(vectordb::VectorRecord("vec1", {1.0, 0.0, 0.0}));
+    collection.insert(vectordb::VectorRecord("vec2", {0.0, 1.0, 0.0}));
+
+    EXPECT_THROW(collection.insert(vectordb::VectorRecord("vec1", {1.0, 0.0})),
+                 std::invalid_argument);
+}
+
 // ============================================================================
 // Persistence Tests (Save/Load)
 // ============================================================================

@@ -1178,4 +1178,154 @@ namespace vectordb::test
         EXPECT_THROW(index.search(std::vector<double>(8, 0.0), 5, impatient), std::invalid_argument);
     }
 
+    // ========================================================================
+    // In-place updates
+    // ========================================================================
+
+    TEST_F(IVFIndexTest, InPlaceUpdatesKeepSearchExact)
+    {
+        // Tight clusters, then random vectors that land far outside every
+        // cone: without widening the radius on add, the bound would certify
+        // answers that miss them.
+        synthetic::VectorGenerator generator(50);
+        auto records = buildRecords(flatten(generator.generateClusters(8, 40, 16, 0.05)));
+
+        IVFIndex index;
+        index.build(records);
+        const std::size_t clusters = index.clusterCount();
+
+        const auto apply = [&](const std::string &id, const std::vector<double> &values)
+        {
+            ASSERT_TRUE(index.add(id, values)) << id;
+            records.insert_or_assign(id, VectorRecord(id, values));
+        };
+
+        for (std::size_t i = 0; i < 200; ++i)
+        {
+            apply("new" + std::to_string(i), generator.generateRandom(16));
+        }
+        for (std::size_t i = 0; i < 320; i += 16)
+        {
+            apply("vec" + std::to_string(i), generator.generateRandom(16)); // replace
+        }
+        for (std::size_t i = 1; i < 320; i += 7)
+        {
+            const std::string id = "vec" + std::to_string(i);
+            ASSERT_TRUE(index.remove(id)) << id;
+            records.erase(id);
+        }
+        for (std::size_t i = 0; i < 200; i += 9)
+        {
+            const std::string id = "new" + std::to_string(i);
+            ASSERT_TRUE(index.remove(id)) << id;
+            records.erase(id);
+        }
+
+        EXPECT_EQ(index.clusterCount(), clusters); // nothing was re-clustered
+        ASSERT_EQ(index.size(), records.size());
+
+        // The clusters still partition the flat indices, and each index maps
+        // back to a live record.
+        std::vector<int> seen(index.size(), 0);
+        for (std::size_t c = 0; c < index.clusterCount(); ++c)
+        {
+            for (std::size_t member : index.clusterMembers(c))
+            {
+                ASSERT_LT(member, index.size());
+                ++seen[member];
+                EXPECT_EQ(records.count(index.id(member)), 1u) << index.id(member);
+            }
+        }
+        EXPECT_TRUE(std::all_of(seen.begin(), seen.end(), [](int count)
+                                { return count == 1; }));
+
+        Collection reference("reference");
+        for (const auto &[id, record] : records)
+        {
+            reference.insert(record);
+        }
+
+        for (std::size_t q = 0; q < 40; ++q)
+        {
+            const std::vector<double> query = generator.generateRandom(16);
+            const SearchResponse response = index.search(query, 10);
+            expectMatchesExact(response.results, reference.searchExact(query, 10),
+                               "query " + std::to_string(q));
+        }
+    }
+
+    TEST_F(IVFIndexTest, AddRefusesWhatItCannotPlace)
+    {
+        IVFIndex empty;
+        EXPECT_FALSE(empty.add("a", {1.0, 0.0}));
+        EXPECT_EQ(empty.size(), 0);
+
+        synthetic::VectorGenerator generator(51);
+        IVFIndex index;
+        index.build(buildRecords(generator.generateRandomVectors(50, 8)));
+
+        EXPECT_FALSE(index.add("a", {1.0, 0.0})); // wrong dimension
+        EXPECT_EQ(index.size(), 50);
+
+        // A zero vector is accepted but not indexed, as in build, and it
+        // replaces any earlier vector with its id.
+        EXPECT_TRUE(index.add("vec0", std::vector<double>(8, 0.0)));
+        EXPECT_EQ(index.size(), 49);
+
+        EXPECT_FALSE(index.remove("vec0"));
+        EXPECT_FALSE(index.remove("missing"));
+    }
+
+    TEST_F(IVFIndexTest, CollectionRebuildsOnlyPastTwentyPercentChurn)
+    {
+        synthetic::VectorGenerator generator(52);
+        Collection collection = buildCollection("churn", generator.generateRandomVectors(100, 16));
+        ASSERT_EQ(collection.clusterCount(), 10); // built over 100 records
+
+        // 20 changes on 100 records is exactly 20%: applied in place. A
+        // rebuild would show, since ceil(sqrt(n)) is 11 for any n in 101..121.
+        for (std::size_t i = 0; i < 15; ++i)
+        {
+            collection.insert(VectorRecord("new" + std::to_string(i), generator.generateRandom(16)));
+        }
+        for (std::size_t i = 0; i < 5; ++i)
+        {
+            ASSERT_TRUE(collection.remove("vec" + std::to_string(i)));
+        }
+        EXPECT_EQ(collection.clusterCount(), 10);
+
+        for (std::size_t q = 0; q < 20; ++q)
+        {
+            const std::vector<double> query = generator.generateRandom(16);
+            expectMatchesExact(collection.searchIVF(query, 10).results,
+                               collection.searchExact(query, 10),
+                               "query " + std::to_string(q));
+        }
+
+        // The 21st change crosses the threshold: rebuilt over 111 records.
+        collection.insert(VectorRecord("new15", generator.generateRandom(16)));
+        EXPECT_EQ(collection.clusterCount(), 11);
+
+        // The count restarts from the rebuild.
+        for (std::size_t i = 16; i < 20; ++i)
+        {
+            collection.insert(VectorRecord("new" + std::to_string(i), generator.generateRandom(16)));
+        }
+        EXPECT_EQ(collection.clusterCount(), 11);
+    }
+
+    TEST_F(IVFIndexTest, CollectionCopiesDoNotShareInPlaceUpdates)
+    {
+        synthetic::VectorGenerator generator(53);
+        Collection original = buildCollection("original", generator.generateRandomVectors(100, 16));
+        const std::vector<double> query = generator.generateRandom(16);
+        original.searchIVF(query, 1); // build the index, which the copy then shares
+
+        Collection copy = original;
+        copy.insert(VectorRecord("match", query));
+
+        EXPECT_EQ(copy.searchIVF(query, 1).results.front().id, "match");
+        EXPECT_NE(original.searchIVF(query, 1).results.front().id, "match");
+    }
+
 } // namespace vectordb::test

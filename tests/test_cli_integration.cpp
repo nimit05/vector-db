@@ -225,6 +225,18 @@ TEST_F(CLIIntegrationTest, SearchWithMismatchedDimensionFails)
     EXPECT_NE(exit_code, 0);
 }
 
+TEST_F(CLIIntegrationTest, InsertWithMismatchedDimensionFails)
+{
+    runCLI("insert test_col vec1 1.0 0.0 0.0");
+
+    auto [exit_code, output] = runCLI("insert test_col vec2 1.0 0.0");
+
+    EXPECT_NE(exit_code, 0);
+
+    auto [list_code, list_output] = runCLI("list test_col");
+    EXPECT_EQ(list_output.find("vec2"), std::string::npos);
+}
+
 TEST_F(CLIIntegrationTest, SearchWithMissingArguments)
 {
     auto [exit_code, output] = runCLI("search test_col 1");

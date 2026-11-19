@@ -119,9 +119,10 @@ namespace vectordb
         /// Default cap on k-means iterations before the build gives up.
         static constexpr std::size_t kMaxIterations = 20;
 
-        /// Subtracted from each cluster's cosine radius at build. Widening every
-        /// cone keeps the bound an over-estimate despite rounding error, so
-        /// numerical error can only cost an early stop, never a false certificate.
+        /// Subtracted from each cluster's cosine radius, at build and whenever
+        /// add() widens a cone. Widening every cone keeps the bound an
+        /// over-estimate despite rounding error, so numerical error can only
+        /// cost an early stop, never a false certificate.
         static constexpr double kRadiusSlack = 1e-9;
 
         /// Margin the k-th best score must clear above the next cluster's bound
@@ -145,6 +146,26 @@ namespace vectordb
         void build(const std::unordered_map<std::string, VectorRecord> &records,
                    std::size_t nlist = 0,
                    unsigned seed = 42);
+
+        /**
+         * Adds one vector without re-clustering, replacing any vector with the
+         * same id. The vector joins the cluster with the nearest centroid, and
+         * that cluster's radius is widened to cover it, so search stays exact.
+         * Centroids do not move, so clustering quality drifts as vectors are
+         * added; the caller decides when to rebuild.
+         *
+         * Returns false, leaving the index unchanged, when the vector cannot be
+         * placed: the index has no clusters, or the dimension differs. A zero
+         * vector is accepted and, as in build, not indexed.
+         */
+        bool add(const std::string &id, const std::vector<double> &values);
+
+        /**
+         * Removes the vector with this id; returns false if it is not indexed.
+         * Its cluster's radius is left as it was: the cone still contains every
+         * remaining member, so the bound stays correct, only looser.
+         */
+        bool remove(const std::string &id);
 
         /**
          * Exact top-k by cosine similarity. Scans clusters in decreasing bound
@@ -244,6 +265,7 @@ namespace vectordb
         std::vector<std::vector<double>> vectors_; // normalized copies of the records
         std::vector<std::size_t> assignment_;      // assignment_[i] = cluster of vectors_[i]
         std::vector<Cluster> clusters_;
+        std::unordered_map<std::string, std::size_t> position_; // id -> flat index
         std::size_t dimension_ = 0;
     };
 

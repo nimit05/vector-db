@@ -99,6 +99,7 @@ namespace vectordb
         vectors_.clear();
         assignment_.clear();
         clusters_.clear();
+        position_.clear();
         dimension_ = 0;
 
         if (records.empty())
@@ -136,6 +137,7 @@ namespace vectordb
                 continue; // zero vector: no direction to cluster on
             }
 
+            position_[record->getId()] = ids_.size();
             ids_.push_back(record->getId());
             vectors_.push_back(std::move(values));
         }
@@ -166,6 +168,90 @@ namespace vectordb
 
         materializeLists();
         computeRadii();
+    }
+
+    bool IVFIndex::add(const std::string &id, const std::vector<double> &values)
+    {
+        if (clusters_.empty() || values.size() != dimension_)
+        {
+            return false;
+        }
+
+        remove(id); // replacing: the old vector must not linger in its cluster
+
+        std::vector<double> normalized = values;
+        if (!normalize(normalized))
+        {
+            return true; // zero vector: excluded, exactly as build excludes it
+        }
+
+        // Nearest centroid, with the same rule and tie-break as assignStep.
+        double bestScore = -std::numeric_limits<double>::infinity();
+        std::size_t best = 0;
+        for (std::size_t c = 0; c < clusters_.size(); ++c)
+        {
+            const double score = dot(normalized, clusters_[c].centroid);
+            if (score > bestScore)
+            {
+                bestScore = score;
+                best = c;
+            }
+        }
+
+        const std::size_t index = vectors_.size();
+        vectors_.push_back(std::move(normalized));
+        ids_.push_back(id);
+        assignment_.push_back(best);
+        position_[id] = index;
+
+        Cluster &cluster = clusters_[best];
+        cluster.members.push_back(index);
+
+        // The bound is only correct while every member lies inside the cone,
+        // so a vector outside it must widen it now, with the same slack as
+        // computeRadii.
+        const double cosRadius = std::clamp(bestScore - kRadiusSlack, -1.0, 1.0);
+        if (cosRadius < cluster.cosRadius)
+        {
+            cluster.cosRadius = cosRadius;
+            cluster.sinRadius = std::sqrt(std::max(0.0, 1.0 - cosRadius * cosRadius));
+        }
+
+        return true;
+    }
+
+    bool IVFIndex::remove(const std::string &id)
+    {
+        const auto found = position_.find(id);
+        if (found == position_.end())
+        {
+            return false;
+        }
+
+        const std::size_t index = found->second;
+        position_.erase(found);
+
+        std::vector<std::size_t> &members = clusters_[assignment_[index]].members;
+        members.erase(std::find(members.begin(), members.end(), index));
+
+        // Fill the hole with the last vector so no other flat index shifts;
+        // only the moved vector's entry in its own cluster needs fixing.
+        const std::size_t last = vectors_.size() - 1;
+        if (index != last)
+        {
+            vectors_[index] = std::move(vectors_[last]);
+            ids_[index] = std::move(ids_[last]);
+            assignment_[index] = assignment_[last];
+            position_[ids_[index]] = index;
+
+            std::vector<std::size_t> &moved = clusters_[assignment_[index]].members;
+            *std::find(moved.begin(), moved.end(), last) = index;
+        }
+
+        vectors_.pop_back();
+        ids_.pop_back();
+        assignment_.pop_back();
+        return true;
     }
 
     void IVFIndex::seedCentroids(std::size_t nlist, unsigned seed)

@@ -25,10 +25,39 @@ namespace vectordb
         return name_;
     }
 
+    /// Adds the record, or replaces the one with the same id. Every vector in a
+    /// collection must have the same length; a mismatch throws. The only
+    /// exception is replacing the collection's sole record, which may change it.
     void Collection::insert(const VectorRecord &record)
     {
+        for (const auto &[id, existing] : records_)
+        {
+            if (id == record.getId())
+            {
+                continue; // being replaced, so its length does not count
+            }
+            if (existing.dimension() != record.dimension())
+            {
+                throw std::invalid_argument(
+                    "Vector length " + std::to_string(record.dimension()) +
+                    " does not match collection '" + name_ + "' length " +
+                    std::to_string(existing.dimension()));
+            }
+            break; // all stored vectors share one length, so one check suffices
+        }
+
         records_[record.getId()] = record;
-        indexDirty_ = true;
+
+        // add() replaces a vector with the same id, so a replacement is one
+        // change, not two. It refuses only what it cannot place (such as the
+        // sole record changing dimension); rebuilding handles that.
+        if (IVFIndex *index = indexForUpdate())
+        {
+            if (!index->add(record.getId(), record.getValues()))
+            {
+                indexDirty_ = true;
+            }
+        }
     }
 
     bool Collection::remove(const std::string &id)
@@ -36,9 +65,36 @@ namespace vectordb
         const bool removed = records_.erase(id) > 0;
         if (removed)
         {
-            indexDirty_ = true;
+            if (IVFIndex *index = indexForUpdate())
+            {
+                index->remove(id);
+            }
         }
         return removed;
+    }
+
+    IVFIndex *Collection::indexForUpdate()
+    {
+        if (indexDirty_ || !index_)
+        {
+            return nullptr; // the next IVF search rebuilds from the records anyway
+        }
+
+        ++changesSinceBuild_;
+        if (static_cast<double>(changesSinceBuild_) > kRebuildChurn * static_cast<double>(sizeAtBuild_))
+        {
+            indexDirty_ = true;
+            index_.reset();
+            return nullptr;
+        }
+
+        // A copy of this collection may share the index; give this one its own
+        // before changing it, so the copy keeps searching its own records.
+        if (index_.use_count() > 1)
+        {
+            index_ = std::make_shared<IVFIndex>(*index_);
+        }
+        return index_.get();
     }
 
     void Collection::saveToFile(const std::string &filename) const
@@ -136,6 +192,8 @@ namespace vectordb
             index->build(records_);
             index_ = index;
             indexDirty_ = false;
+            changesSinceBuild_ = 0;
+            sizeAtBuild_ = records_.size();
         }
 
         return *index_;
